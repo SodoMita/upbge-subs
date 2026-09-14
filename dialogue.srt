@@ -1,0 +1,83 @@
+1
+00:00:00,000 --> 00:00:01,875
+[CAM Wide]
+CUBY: Hey! I'm Cuby.
+I'm a cube, obviously.
+
+2
+00:00:01,875 --> 00:00:03,750
+SPHERO: I'm Sphero!
+Round, zero corners!
+
+3
+00:00:03,750 --> 00:00:05,625
+[CAM Cuby]
+CUBY: We're super
+low-effort models.
+
+4
+00:00:05,625 --> 00:00:07,500
+[CAM Sphero]
+SPHERO: Just primitives
+and a dream!
+
+5
+00:00:07,500 --> 00:00:09,375
+[CAM Cuby]
+CUBY: But subtitles?
+Real 3D geometry!
+
+6
+00:00:09,375 --> 00:00:11,250
+[CAM Sphero]
+SPHERO: They type live,
+letter by letter!
+
+7
+00:00:11,250 --> 00:00:13,125
+[CAM Cuby]
+CUBY: Drag my keyframes
+in the Timeline!
+
+8
+00:00:13,125 --> 00:00:15,000
+[CAM Wide]
+BOTH: One more thing -
+pick a robot!
+
+9
+00:00:15,000 --> 00:00:17,000
+[CAM Wide]
+Who gets the last word?
+
+10
+00:00:17,000 --> 00:00:18,875
+[CAM Cuby]
+CUBY: Cubes rule!
+Six sides of awesome.
+
+11
+00:00:18,875 --> 00:00:20,750
+CUBY: Count my corners:
+eight! All mine!
+
+12
+00:00:20,750 --> 00:00:22,500
+CUBY: Stay square,
+friend!
+
+13
+00:00:23,000 --> 00:00:24,875
+[CAM Sphero]
+SPHERO: Spheres supreme!
+Zero corners, zero fear!
+
+14
+00:00:24,875 --> 00:00:26,750
+SPHERO: I roll everywhere.
+Beats walking!
+
+15
+00:00:26,750 --> 00:00:28,500
+SPHERO: Stay round!
+See you!

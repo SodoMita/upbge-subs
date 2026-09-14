@@ -1,0 +1,50 @@
+# Talking Robots story: playable sets of subtitles + object animation.
+# Subtitle TEXT lives in dialogue.srt (edit with any subtitle software);
+# MOTION lives on the timeline (keyframes on any object). This file only
+# wires them together: which cues+frames form a set, what plays at start,
+# which actors the game animates, what each end activates, and what the
+# choices offer. The game reads this file + dialogue.srt live: tweak keys,
+# retime cues, rewire sets - then press P. No rebuild, no re-export.
+#
+# Workflow: add subtitles + keyframes in sync on the timeline, group them
+# into a set below (SRT cue numbers + timeline frames), pick the start set,
+# add options to a choice, and set what each set activates on its end
+# (stop | goto <set> | choice <id>). Sets ending in a choice end at their
+# prompt cue's start; the prompt text is that SRT cue's own text.
+start: main
+cps: 30
+subs: dialogue.srt
+actors:
+  - Camera
+  - CubyRoot
+  - SpheroRoot
+  - CubyMouth
+  - SpheroMouth
+  - CubyArmR
+  - SpheroArmR
+  - CubyEyeL
+  - CubyEyeR
+  - SpheroEyeL
+  - SpheroEyeR
+sets:
+  main:
+    cues: [1, 9]
+    frames: [1, 361]
+    lens: 50
+    end: choice pick
+  cuby:
+    cues: [10, 12]
+    frames: [409, 541]
+    lens: 55
+    end: stop
+  sphero:
+    cues: [13, 15]
+    frames: [553, 685]
+    lens: 45
+    end: stop
+choices:
+  pick:
+    prompt_cue: 9
+    options:
+      - [1, "Ask Cuby about cubes", cuby]
+      - [2, "Ask Sphero about spheres", sphero]
