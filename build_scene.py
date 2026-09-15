@@ -1152,4 +1152,8 @@ def main():
         pass
 
 
-main()
+if __name__ == "__main__":
+    # Blender executes a -P script as __main__, so the build still runs; but
+    # resave_game.py / verify_game.py import this module to reuse the brick
+    # helpers, and importing must NOT rebuild the scene.
+    main()
