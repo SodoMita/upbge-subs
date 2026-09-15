@@ -2296,11 +2296,18 @@ def build_uids(scene, refs, old_uids, stamp=True):
     # ids that are gone from the file but still named by story.yml: keep the
     # record so an undo / re-create / hand-fix does not lose the mapping
     named = set(refs["objects"]) | set(refs["cameras"]) | set(refs["actions"])
-    for uid, rec in (old_uids or {}).items():
+    claimed = {(r.get("name"), r.get("type")) for r in uids.values()
+               if isinstance(r, dict)}
+    for uid, rec in sorted((old_uids or {}).items()):
         if uid in uids or not isinstance(rec, dict):
             continue
-        if rec.get("name") in named:
-            uids[uid] = {"name": rec["name"], "type": rec.get("type", "OBJECT")}
+        key = (rec.get("name"), rec.get("type", "OBJECT"))
+        if key[0] not in named or key in claimed:
+            continue        # unreferenced, or a live id already claims it:
+                            # a from-scratch rebuild would otherwise pile up
+                            # one stale record per object, forever
+        uids[uid] = {"name": key[0], "type": key[1]}
+        claimed.add(key)
     ordered = {u: uids[u] for u in sorted(uids)}
     pending.sort(key=lambda p: (p["kind"], p["old"]))
     return ordered, pending
@@ -3085,9 +3092,22 @@ def preview_set_impl(scene, set_name):
             if opts:
                 body = (body + "\n\n" + lib.menu_body(opts)) if body else \
                     lib.menu_body(opts)
-            _set_body(menu, body)
-            menu.scale = (1.0, 1.0, 1.0)
-            menu_note = "menu: choice '%s'" % target
+            # The menu has no keys in v2, so whatever is posed here is what the
+            # timeline shows at frame 1. The game shows it once every blocking
+            # anim has finished - i.e. at set_duration(plan), the END of any
+            # set with a blocking subs/action anim - so such a set is parked at
+            # rest (scale it to 1 by hand to place the text). Only a choice
+            # that gates the set at t=0 is posed visible.
+            at = lib.set_duration(plan)
+            if at > 0.5:
+                _set_body(menu, "")
+                menu.scale = (0.0, 0.0, 0.0)
+                menu_note = ("menu parked (choice '%s' appears at t=%.1fs; "
+                             "scale it to 1 to place it)" % (target, at))
+            else:
+                _set_body(menu, body)
+                menu.scale = (1.0, 1.0, 1.0)
+                menu_note = "menu: choice '%s'" % target
         else:
             _set_body(menu, "")
             menu.scale = (0.0, 0.0, 0.0)   # scale, never hide_render (UPBGE)

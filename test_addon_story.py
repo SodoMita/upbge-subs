@@ -185,10 +185,12 @@ eq(main_cam.data.lens, 50.0, "camera lens snapped to Wide")
 eq(tuple(round(v, 3) for v in main_cam.location), SHOTS["Wide"],
    "camera pose snapped to Wide")
 eq(sub.tw_cps, 30.0, "cps taken from story.yml")
-check("Who gets the last word?" in menu.data.body, "menu shows the prompt",
-      repr(menu.data.body))
-check("> 1: Ask Cuby about cubes" in menu.data.body, "menu shows option 1")
-eq(tuple(menu.scale), (1.0, 1.0, 1.0), "menu visible")
+# v2: the menu has no keys, and the game only shows it once every blocking
+# anim has finished (set_duration) - so a blocking set parks it at rest.
+eq(menu.data.body, "", "menu parked: 'pick' appears at the end of the set")
+eq(tuple(menu.scale), (0.0, 0.0, 0.0), "parked menu rests at scale 0")
+check("menu parked" in msg and "choice 'pick'" in msg,
+      "preview says the menu is parked and when it appears", msg)
 eq(scene.tw_preview_set, "main", "tw_preview_set indicator")
 eq(scene.tw_preview_range, "1-361", "tw_preview_range indicator")
 # the set's own animation must actually evaluate (slot correctness proof)
@@ -207,9 +209,9 @@ eq(bpy.data.objects["CubyRoot"].animation_data.action.name, "cuby__cuby",
 check(bpy.data.objects["SpheroRoot"].animation_data.action is None,
       "SpheroRoot detached (not in this set)")
 eq(main_cam.data.lens, 55.0, "lens snapped to Cuby shot")
-check("Stay square" in menu.data.body, "menu shows the pick2 prompt",
-      repr(menu.data.body))
-check("Ask Sphero instead" in menu.data.body, "menu shows pick2 option 2")
+eq(tuple(menu.scale), (0.0, 0.0, 0.0), "cuby's menu parked too (blocking set)")
+check("menu parked" in msg and "pick2" in msg,
+      "cuby preview reports the parked pick2 menu", msg)
 
 print("=== Preview Set: sphero (end: stop) ===", flush=True)
 ok, msg, info = tw.preview_set_impl(scene, "sphero")
@@ -223,6 +225,40 @@ check(not menu.hide_render, "menu is NOT hide_render (UPBGE would skip it)")
 print("=== Preview Set: error paths ===", flush=True)
 ok, msg, _i = tw.preview_set_impl(scene, "nosuchset")
 check(not ok and "no set 'nosuchset'" in msg, "unknown set is rejected", msg)
+
+# A set with no blocking anim at all gates on its choice at t=0, so THAT menu
+# must be posed visible (with the real prompt/option text) for hand-placing.
+print("=== Preview Set: choice gating at t=0 shows the menu ===", flush=True)
+with open(STORY, encoding="utf-8") as fh:
+    _orig_story = fh.read()          # read fully BEFORE any write (truncation)
+_instant = _orig_story.replace(
+    "choices:\n",
+    "  instant:\n    anims:\n      - camera: Wide\n    end: choice pick\n"
+    "choices:\n", 1)
+check(_instant != _orig_story, "fixture: 'instant' set injected")
+with open(STORY, "w", encoding="utf-8", newline="\n") as fh:
+    fh.write(_instant)
+try:
+    ok, msg, info = tw.preview_set_impl(scene, "instant")
+    check(ok, "preview instant ok", msg)
+    eq(info["plan"]["dur"], 0.0, "no blocking anim -> blocking end 0.0")
+    eq((scene.frame_start, scene.frame_end), (1, 2),
+       "a t=0 set still spans at least 2 frames")
+    check("Who gets the last word?" in menu.data.body,
+          "menu shows the prompt", repr(menu.data.body))
+    check("> 1: Ask Cuby about cubes" in menu.data.body,
+          "menu shows option 1 with the cursor")
+    check("  2: Ask Sphero about spheres" in menu.data.body,
+          "menu shows option 2")
+    eq(tuple(menu.scale), (1.0, 1.0, 1.0),
+       "menu visible when the choice gates at t=0")
+    check("menu: choice 'pick'" in msg, "preview reports the visible menu", msg)
+finally:
+    with open(STORY, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(_orig_story)
+ok, msg, _i = tw.preview_set_impl(scene, "sphero")   # restore prior state
+check(ok, "story.yml restored: sphero previews again", msg)
+eq(menu.data.body, "", "menu back at rest after restoring the story")
 
 # ------------------------------------------------------------ rename watch --
 print("=== rename watcher: object ===", flush=True)

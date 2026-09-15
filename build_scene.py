@@ -2,10 +2,25 @@
 """Build the Talking Robots scene: two low-effort primitive characters with
 3D typewriter subtitles (Typewriter Subtitles addon) + UPBGE game logic.
 
-Story sets/actors/choices come from story.yml, subtitle text + the [CAM]
-shot plan from dialogue.srt (see story.py for the formats).
+v2 is animation-centric: story.yml wires named SETS of animations that all
+play from t=0, so this script builds ONE local-timed starter action per
+(set, actor) - main__cuby, cuby__cubymouth, sphero__spheroarm, ... - instead
+of v1's single master timeline. The game driver (game_subtitles.py) plays
+those actions and moves the camera procedurally between the staged shots, so
+there is NO camera bake and NO SET-/CH- timeline markers any more, and the
+choice menu is a plain object the game poses (Preview Set poses it too).
 
-Run with a UI (logic bricks need one):
+ADDITIVE / IDEMPOTENT by design: everything is create-if-missing. A second
+run never deletes an action, a keyframe, an object or a material slot, so
+hand-tweaked animation survives a rebuild and "build twice" is a supported
+operation (verify_game.py checks exactly that).
+
+The build finishes by previewing the story's START set (frame range, actions,
+subtitle cues, opening shot, menu), baking that set's subtitles to
+`<set>_Line##` objects so the file plays and renders with no add-on at all,
+and writing story.sync.json + story.schema.json.
+
+Run with a UI (logic bricks segfault in `blender -b`):
     xvfb-run -a upbge --factory-startup -P build_scene.py   (quits itself)
 Saves talking_robots.blend next to this script.
 """
@@ -13,6 +28,7 @@ import bpy
 import math
 import os
 import random
+import subprocess
 import sys
 from mathutils import Euler, Vector
 
@@ -23,8 +39,44 @@ import story as sb
 
 FPS = 24
 FRAME_START = 1
-FRAME_END = None  # computed from dialogue.srt in main()
+FRAME_END = None  # computed from the start set in main()
 CPS = 30.0
+
+# Staging rig: the shots story.yml (`camera: Shot`) and the SRT `[CAM Shot]`
+# lines name. These are scene data, not story data, so they live here - each
+# staged camera carries its OWN lens and the game follows it live (v1 kept
+# them in story.py and baked a Camera_anim; v2 never bakes the camera).
+WIDE_A = ((0.0, -7.3, 3.35), (0.0, 0.0, 1.05))
+WIDE_B = ((0.0, -6.7, 3.05), (0.0, 0.0, 1.05))
+SHOT_POSES = {"Wide": WIDE_A, "WideEnd": WIDE_B,
+              "Cuby": ((-1.55, -4.35, 2.05), (-1.25, 0.0, 1.05)),
+              "Sphero": ((1.55, -4.35, 2.05), (1.25, 0.0, 1.05))}
+SHOT_LENS = {"Wide": 50, "WideEnd": 50, "Cuby": 55, "Sphero": 45}
+
+# Per-actor look: rest pose + how it acts. Rest poses are re-applied on every
+# build so a rebuild is deterministic even if an action left the object mid
+# gesture (the actions themselves are never touched).
+ROOT_BASE = {                     # name -> (rest location, base z, phase)
+    "CubyRoot": ((-1.25, 0.0, 0.0), 0.0, 0.0),
+    "SpheroRoot": ((1.25, 0.0, 0.12), 0.12, 2.1),
+}
+MOUTH_REST = {"CubyMouth": (0.34, 0.05, 0.035),
+              "SpheroMouth": (0.34, 0.05, 0.035)}
+MOUTH_OPEN = (0.30, 0.05, 0.16)
+ARM_REST_RY = {"CubyArmR": -0.3, "SpheroArmR": -0.5}
+SPEAKER_OF = {"CubyRoot": "CUBY", "CubyMouth": "CUBY", "CubyArmR": "CUBY",
+              "SpheroRoot": "SPHERO", "SpheroMouth": "SPHERO",
+              "SpheroArmR": "SPHERO"}
+FLAP = {"CUBY": (7.0, 0.0), "SPHERO": (6.3, 1.3)}      # Hz, phase
+EYES = {"CUBY": ("CubyEyeL", "CubyEyeR"),
+        "SPHERO": ("SpheroEyeL", "SpheroEyeR")}
+BLINK_PERIOD = 84
+BLINK_FRAMES = 3
+# The ranges story.sync.json must end up with (the game divides them by fps
+# to know how long a blocking action runs). Asserted after the build.
+WANT_RANGES = {"main": 361, "cuby": 91, "sphero": 133}
+
+TAU = 2.0 * math.pi
 
 
 def log(msg):
@@ -32,21 +84,14 @@ def log(msg):
 
 
 # --------------------------------------------------------------------------
-# small helpers
+# small helpers (all idempotent: a rebuild reuses what is already there)
 # --------------------------------------------------------------------------
-
-def clear_scene():
-    for o in list(bpy.data.objects):
-        try:
-            bpy.data.objects.remove(o, do_unlink=True)
-        except Exception:
-            pass
-    log("scene cleared")
-
 
 def make_mat(name, color, roughness=0.65, emission_color=None,
              emission_strength=0.0):
-    mat = bpy.data.materials.new(name)
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     bsdf = mat.node_tree.nodes.get("Principled BSDF")
     if bsdf is not None:
@@ -65,13 +110,39 @@ def make_mat(name, color, roughness=0.65, emission_color=None,
     return mat
 
 
+def use_mat(obj, mat):
+    """Assign a material without stacking slots on a rebuild."""
+    slots = obj.data.materials
+    for i, m in enumerate(slots):
+        if m is not None and m.name == mat.name:
+            return i
+    slots.append(mat)
+    return len(slots) - 1
+
+
 def link(obj):
-    bpy.context.scene.collection.objects.link(obj)
+    scene = bpy.context.scene
+    if obj.name not in scene.collection.objects:
+        scene.collection.objects.link(obj)
     return obj
 
 
+def ensure_empty(name, size=0.4):
+    o = bpy.data.objects.get(name)
+    if o is not None:
+        return o
+    o = link(bpy.data.objects.new(name, None))
+    o.empty_display_type = 'PLAIN_AXES'
+    o.empty_display_size = size
+    return o
+
+
 def prim(op, name, **kwargs):
-    """Run a primitive-add op, rename result. Location baked into kwargs."""
+    """Run a primitive-add op and rename the result - or reuse the object a
+    previous build already made (never a second one with a .001 suffix)."""
+    o = bpy.data.objects.get(name)
+    if o is not None:
+        return o
     op(**kwargs)
     o = bpy.context.active_object
     o.name = name
@@ -93,6 +164,9 @@ def smooth(obj):
 
 
 def add_text(name, body, size=0.5):
+    o = bpy.data.objects.get(name)
+    if o is not None:
+        return o
     bpy.ops.object.text_add(location=(0, 0, 0))
     o = bpy.context.active_object
     o.name = name
@@ -103,35 +177,71 @@ def add_text(name, body, size=0.5):
     return o
 
 
-def _key_cam_pose2(cam, frame, loc, eul, lens, interp, interp_map):
-    cam.location = tuple(loc)
-    cam.rotation_euler = eul
-    cam.data.lens = lens
-    cam.keyframe_insert("location", frame=frame)
-    cam.keyframe_insert("rotation_euler", frame=frame)
-    cam.data.keyframe_insert("lens", frame=frame)
-    interp_map[int(frame)] = interp
+def ensure_camera(name, lens):
+    """A camera object with its own lens (the staged shots carry their framing
+    AND their optics - the game follows both live)."""
+    o = bpy.data.objects.get(name)
+    if o is None:
+        cam = bpy.data.cameras.get(name)
+        if cam is None:
+            cam = bpy.data.cameras.new(name)
+        o = link(bpy.data.objects.new(name, cam))
+    try:
+        o.data.lens = lens
+    except Exception:
+        pass
+    return o
 
 
-def build_staged_cams():
-    """Real camera objects per shot (Wide/WideEnd/Cuby/Sphero): the editor
-    framing rig. Starter timeline keys are baked from them at build; the
-    game plays the baked actions (tweak keys + press P, no rebuild)."""
-    staged = {}
-    for name, (loc, tgt) in sb.SHOT_POSES.items():
-        bpy.ops.object.camera_add(location=loc)
-        c = bpy.context.active_object
-        c.name = name
-        c.data.lens = sb.SHOT_LENS[name]
-        look_at(c, tgt)
-        staged[name] = c
-    log("staged %d shot cameras" % len(staged))
-    return staged
+def ensure_action(obj, name, poser):
+    """Create the local-timed action `name` on obj, or leave it alone.
+
+    NEVER deletes or rewrites keys: once an action exists its keys belong to
+    the user (that is the whole point of "tweak keys, press P, no rebuild"),
+    so a rebuild only fills in what is missing. Returns (action, created).
+    """
+    act = bpy.data.actions.get(name)
+    if act is not None:
+        return act, False
+    ad = obj.animation_data
+    if ad is None:
+        ad = obj.animation_data_create()
+    ad.action = None          # forces a brand-new action (and its own slot)
+    poser(obj)
+    act = ad.action
+    if act is None:
+        raise RuntimeError("keying %s produced no action" % name)
+    act.name = name
+    act.use_fake_user = True   # only assigned while previewed -> purge bait
+    return act, True
+
+
+def apply_rest_poses():
+    """Put every actor back on its authored rest pose (no keys involved)."""
+    for name, (loc, _bz, _ph) in ROOT_BASE.items():
+        o = bpy.data.objects.get(name)
+        if o is None:
+            continue
+        o.location = loc
+        o.scale = (1.0, 1.0, 1.0)
+    for name, sc in MOUTH_REST.items():
+        o = bpy.data.objects.get(name)
+        if o is not None:
+            o.scale = sc
+    for name, ry in ARM_REST_RY.items():
+        o = bpy.data.objects.get(name)
+        if o is not None:
+            o.rotation_euler = (0.0, ry, 0.0)
+    for names in EYES.values():
+        for name in names:
+            o = bpy.data.objects.get(name)
+            if o is not None:
+                o.scale = (1.0, 1.0, 1.0)
 
 
 # --------------------------------------------------------------------------
 # scene setup
-# --------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 def setup_scene():
     scene = bpy.context.scene
@@ -164,98 +274,73 @@ def setup_scene():
     log("scene settings done")
 
 
-def build_lights_camera(cues, cams):
-    # key sun
-    bpy.ops.object.light_add(type='SUN', location=(4, -3, 6))
-    sun = bpy.context.active_object
-    sun.name = "KeySun"
+# --------------------------------------------------------------------------
+# lights + cameras (v2: staged rig only, NO camera bake)
+# --------------------------------------------------------------------------
+
+def build_staged_cams():
+    """One real camera object per shot: the editor's framing rig.
+
+    v2 never bakes them into a Camera_anim - the game interpolates between
+    them procedurally (smoothstep + slerp, lens followed live) and Preview Set
+    snaps the render camera onto a set's opening shot. Each keeps its own lens.
+    """
+    staged = {}
+    for name, (loc, tgt) in SHOT_POSES.items():
+        c = ensure_camera(name, SHOT_LENS[name])
+        c.location = loc
+        look_at(c, tgt)
+        staged[name] = c
+    log("staged %d shot cameras (%s)"
+        % (len(staged), ", ".join("%s %dmm" % (n, SHOT_LENS[n])
+                                  for n in sorted(staged))))
+    return staged
+
+
+def build_lights_camera():
+    """Key/fill suns + the single render camera (subtitles and the menu are
+    parented to it, which is why there is only one)."""
+    sun = bpy.data.objects.get("KeySun")
+    if sun is None:
+        bpy.ops.object.light_add(type='SUN', location=(4, -3, 6))
+        sun = bpy.context.active_object
+        sun.name = "KeySun"
     look_at(sun, (0, 0, 1))
     try:
         sun.data.energy = 4.0
-    except Exception:
-        pass
-    try:
         sun.data.angle = 0.15
     except Exception:
         pass
-    # cool fill sun (no shadow)
-    bpy.ops.object.light_add(type='SUN', location=(-5, 2, 4))
-    fill = bpy.context.active_object
-    fill.name = "FillSun"
+    fill = bpy.data.objects.get("FillSun")
+    if fill is None:
+        bpy.ops.object.light_add(type='SUN', location=(-5, 2, 4))
+        fill = bpy.context.active_object
+        fill.name = "FillSun"
     look_at(fill, (0, 0, 1))
     try:
         fill.data.energy = 0.8
-    except Exception:
-        pass
-    try:
         fill.data.use_shadow = False
     except Exception:
         pass
-    # the single render camera; [CAM] shots become keys copied from the
-    # staged cameras (cuts between them, push-in drift inside Wide spans)
-    bpy.ops.object.camera_add(location=sb.WIDE_A[0])
-    cam = bpy.context.active_object
-    cam.name = "Camera"
-    cam.data.lens = 50
+    cam = ensure_camera("Camera", SHOT_LENS["Wide"])
     try:
         cam.data.clip_start = 0.1
         cam.data.clip_end = 100.0
     except Exception:
         pass
     bpy.context.scene.camera = cam
-    staged = build_staged_cams()
+    cam["_tw_role"] = "camera"
+    build_staged_cams()
     bpy.context.view_layer.update()
-    la = staged["Wide"].matrix_world.to_translation()
-    ea = staged["Wide"].matrix_world.to_euler()
-    lb = staged["WideEnd"].matrix_world.to_translation()
-    eb = staged["WideEnd"].matrix_world.to_euler()
-
-    def wide_pose(f):
-        k = (f - FRAME_START) / max(FRAME_END - FRAME_START, 1)
-        loc = [la[i] + (lb[i] - la[i]) * k for i in range(3)]
-        return loc, Euler([ea[i] + (eb[i] - ea[i]) * k for i in range(3)],
-                          'XYZ')
-
-    interp_map = {}
-    spans = sb.cam_spans(cams, FPS, FRAME_START, FRAME_END)
-    for (f0, f1, shot) in spans:
-        lens = sb.SHOT_LENS[shot]
-        if shot == "Wide":
-            loc, eul = wide_pose(f0)
-            _key_cam_pose2(cam, f0, loc, eul, lens, 'BEZIER', interp_map)
-            if f1 > f0:
-                loc, eul = wide_pose(f1)
-                _key_cam_pose2(cam, f1, loc, eul, lens, 'CONSTANT', interp_map)
-        else:
-            m = staged[shot].matrix_world
-            _key_cam_pose2(cam, f0, m.to_translation(), m.to_euler(), lens,
-                            'CONSTANT', interp_map)
+    # No keys on the render camera: v2's camera is procedural in game and
+    # snapped per set in the editor. If a v1 Camera_anim is still assigned it
+    # would override both, so report it instead of silently deleting keys.
     ad = cam.animation_data
     if ad is not None and ad.action is not None:
-        for fc in tw._action_fcurves(ad.action):
-            if fc.data_path in ("location", "rotation_euler"):
-                for k in fc.keyframe_points:
-                    want = interp_map.get(int(round(k.co.x)))
-                    if want is not None:
-                        k.interpolation = want
-                fc.update()
-    dad = cam.data.animation_data
-    if dad is not None and dad.action is not None:
-        for fc in tw._action_fcurves(dad.action):
-            if fc.data_path == "lens":
-                for k in fc.keyframe_points:
-                    want = interp_map.get(int(round(k.co.x)))
-                    if want is not None:
-                        k.interpolation = want
-                fc.update()
-    if cam.animation_data is not None and \
-            cam.animation_data.action is not None:
-        cam.animation_data.action.name = "Camera_anim"
-    if cam.data.animation_data is not None and \
-            cam.data.animation_data.action is not None and \
-            cam.data.animation_data.action is not cam.animation_data.action:
-        cam.data.animation_data.action.name = "Camera_lens_anim"
-    log("lights + camera done (%d shot spans)" % len(spans))
+        log("NOTE: '%s' still drives the render camera (v1 bake). v2 moves it "
+            "procedurally - unassign it if you want Preview Set to frame."
+            % ad.action.name)
+    log("lights + render camera done (no camera bake)")
     return cam
 
 
@@ -263,19 +348,19 @@ def build_set(mats):
     # ground far below
     g = prim(bpy.ops.mesh.primitive_plane_add, "Ground",
              size=40, location=(0, 0, -0.2))
-    g.data.materials.append(mats['ground'])
+    use_mat(g, mats['ground'])
     # round talk-show stage
     st = prim(bpy.ops.mesh.primitive_cylinder_add, "Stage",
               radius=3.0, depth=0.2, location=(0, 0, -0.099),
               vertices=48)
-    st.data.materials.append(mats['stage'])
+    use_mat(st, mats['stage'])
     # light beams (fake volumetrics: emission cones)
     for nm, x, tilt in (("BeamL", -1.25, 0.06), ("BeamR", 1.25, -0.06)):
         cone = prim(bpy.ops.mesh.primitive_cone_add, nm,
                     radius1=0.65, radius2=0.18, depth=6.0,
                     location=(x, 1.8, 3.2))
         cone.rotation_euler = (0.0, tilt, 0.0)
-        cone.data.materials.append(mats['beam'])
+        use_mat(cone, mats['beam'])
         smooth(cone)
     # scattered low-poly rocks
     rng = random.Random(7)
@@ -290,16 +375,12 @@ def build_set(mats):
                                rng.uniform(0, 3))
         rock.scale = (rng.uniform(0.7, 1.3), rng.uniform(0.7, 1.3),
                       rng.uniform(0.5, 1.0))
-        rock.data.materials.append(mats['rock'])
+        use_mat(rock, mats['rock'])
     log("set done")
 
 
-# --------------------------------------------------------------------------
-# characters (low effort, maximum charm)
-# --------------------------------------------------------------------------
-
 def build_cuby(mats):
-    root = link(bpy.data.objects.new("CubyRoot", None))
+    root = ensure_empty("CubyRoot")
     root.empty_display_type = 'PLAIN_AXES'
     root.empty_display_size = 0.4
     root.location = (-1.25, 0, 0)
@@ -307,13 +388,13 @@ def build_cuby(mats):
                 size=1.1, location=(0, 0, 0))
     body.parent = root
     body.location = (0, 0, 0.95)
-    body.data.materials.append(mats['cuby'])
+    use_mat(body, mats['cuby'])
     for i, sx in enumerate((-0.28, 0.28)):
         leg = prim(bpy.ops.mesh.primitive_cylinder_add, f"CubyLeg{i}",
                    radius=0.12, depth=0.45, location=(0, 0, 0))
         leg.parent = root
         leg.location = (sx, 0, 0.225)
-        leg.data.materials.append(mats['dark'])
+        use_mat(leg, mats['dark'])
     arms = {}
     for nm, sx, ry in (("CubyArmL", 0.68, 0.3), ("CubyArmR", -0.68, -0.3)):
         arm = prim(bpy.ops.mesh.primitive_cylinder_add, nm,
@@ -321,7 +402,7 @@ def build_cuby(mats):
         arm.parent = root
         arm.location = (sx, 0, 0.85)
         arm.rotation_euler = (0, ry, 0)
-        arm.data.materials.append(mats['cuby_dark'])
+        use_mat(arm, mats['cuby_dark'])
         arms[nm] = arm
     eyes = []
     for nm, sx in (("CubyEyeL", 0.23), ("CubyEyeR", -0.23)):
@@ -330,14 +411,14 @@ def build_cuby(mats):
                      location=(0, 0, 0))
         white.parent = root
         white.location = (sx, -0.50, 1.18)
-        white.data.materials.append(mats['white'])
+        use_mat(white, mats['white'])
         smooth(white)
         pup = prim(bpy.ops.mesh.primitive_uv_sphere_add, nm + "Pupil",
                    radius=0.07, segments=12, ring_count=8,
                    location=(0, 0, 0))
         pup.parent = white
         pup.location = (0, -0.13, 0.01)
-        pup.data.materials.append(mats['black'])
+        use_mat(pup, mats['black'])
         smooth(pup)
         eyes.append(white)
     mouth = prim(bpy.ops.mesh.primitive_cube_add, "CubyMouth",
@@ -345,30 +426,30 @@ def build_cuby(mats):
     mouth.parent = root
     mouth.location = (0, -0.545, 0.80)
     mouth.scale = (0.34, 0.05, 0.035)
-    mouth.data.materials.append(mats['black'])
+    use_mat(mouth, mats['black'])
     ant = prim(bpy.ops.mesh.primitive_cylinder_add, "CubyAntenna",
                radius=0.03, depth=0.5, location=(0, 0, 0))
     ant.parent = root
     ant.location = (0.3, 0.2, 1.7)
-    ant.data.materials.append(mats['dark'])
+    use_mat(ant, mats['dark'])
     tip = prim(bpy.ops.mesh.primitive_uv_sphere_add, "CubyTip",
                radius=0.08, location=(0, 0, 0))
     tip.parent = root
     tip.location = (0.3, 0.2, 1.98)
-    tip.data.materials.append(mats['red_glow'])
+    use_mat(tip, mats['red_glow'])
     smooth(tip)
     tag = add_text("CubyTag", "CUBY", size=0.20)
     tag.parent = root
     tag.location = (0, -0.60, 1.02)
     tag.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
-    tag.data.materials.append(mats['tag_blue'])
+    use_mat(tag, mats['tag_blue'])
     log("cuby built")
     return {"root": root, "mouth": mouth, "arm_r": arms["CubyArmR"],
             "arm_r_ry": -0.3, "eyes": eyes}
 
 
 def build_sphero(mats):
-    root = link(bpy.data.objects.new("SpheroRoot", None))
+    root = ensure_empty("SpheroRoot")
     root.empty_display_type = 'PLAIN_AXES'
     root.empty_display_size = 0.4
     root.location = (1.25, 0, 0.12)  # hover base height
@@ -377,7 +458,7 @@ def build_sphero(mats):
                 location=(0, 0, 0))
     body.parent = root
     body.location = (0, 0, 0.95)
-    body.data.materials.append(mats['sphero'])
+    use_mat(body, mats['sphero'])
     smooth(body)
     arms = {}
     for nm, sx, ry in (("SpheroArmL", 0.82, 0.5),
@@ -387,7 +468,7 @@ def build_sphero(mats):
         arm.parent = root
         arm.location = (sx, 0, 0.85)
         arm.rotation_euler = (0, ry, 0)
-        arm.data.materials.append(mats['sphero_dark'])
+        use_mat(arm, mats['sphero_dark'])
         arms[nm] = arm
     eyes = []
     for nm, sx in (("SpheroEyeL", 0.25), ("SpheroEyeR", -0.25)):
@@ -396,14 +477,14 @@ def build_sphero(mats):
                      location=(0, 0, 0))
         white.parent = root
         white.location = (sx, -0.62, 1.18)
-        white.data.materials.append(mats['white'])
+        use_mat(white, mats['white'])
         smooth(white)
         pup = prim(bpy.ops.mesh.primitive_uv_sphere_add, nm + "Pupil",
                    radius=0.075, segments=12, ring_count=8,
                    location=(0, 0, 0))
         pup.parent = white
         pup.location = (0, -0.14, 0.01)
-        pup.data.materials.append(mats['black'])
+        use_mat(pup, mats['black'])
         smooth(pup)
         eyes.append(white)
     mouth = prim(bpy.ops.mesh.primitive_cube_add, "SpheroMouth",
@@ -411,292 +492,417 @@ def build_sphero(mats):
     mouth.parent = root
     mouth.location = (0, -0.72, 0.68)
     mouth.scale = (0.34, 0.05, 0.035)
-    mouth.data.materials.append(mats['black'])
+    use_mat(mouth, mats['black'])
     hat = prim(bpy.ops.mesh.primitive_cone_add, "SpheroHat",
                radius1=0.28, radius2=0.02, depth=0.55,
                location=(0, 0, 0))
     hat.parent = root
     hat.location = (0.15, 0, 1.95)
-    hat.data.materials.append(mats['hat'])
+    use_mat(hat, mats['hat'])
     smooth(hat)
     pom = prim(bpy.ops.mesh.primitive_uv_sphere_add, "SpheroPom",
                radius=0.09, location=(0, 0, 0))
     pom.parent = root
     pom.location = (0.15, 0, 2.26)
-    pom.data.materials.append(mats['pom'])
+    use_mat(pom, mats['pom'])
     smooth(pom)
     ring = prim(bpy.ops.mesh.primitive_torus_add, "SpheroRing",
                 major_radius=0.5, minor_radius=0.07, location=(0, 0, 0))
     ring.parent = root
     ring.location = (0, 0, 0.10)
-    ring.data.materials.append(mats['cyan_glow'])
+    use_mat(ring, mats['cyan_glow'])
     smooth(ring)
     tag = add_text("SPHERO", "SPHERO", size=0.17)
     tag.parent = root
     tag.location = (0, -0.86, 0.92)
     tag.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
-    tag.data.materials.append(mats['tag_orange'])
+    use_mat(tag, mats['tag_orange'])
     log("sphero built")
     return {"root": root, "mouth": mouth, "arm_r": arms["SpheroArmR"],
             "arm_r_ry": -0.5, "eyes": eyes}
 
 
 # --------------------------------------------------------------------------
-# subtitles via the addon (SRT import) + branches
+# subtitles + choice menu (v2: content arrives via Preview Set, not a master
+# timeline import)
 # --------------------------------------------------------------------------
 
-def build_subtitles(scene, cam, mats, cues, cps):
-    bpy.ops.object.text_add(location=(0, 0, 0))
-    sub = bpy.context.active_object
-    sub.name = "Subtitles"
+def build_subtitles(scene, cam, mats, cps):
+    """The subtitle text object: parented to the render camera, tagged, empty.
+
+    v1 imported every cue of dialogue.srt onto one master timeline and baked
+    them. v2 sets are local-timed, so the cues of the set being previewed are
+    loaded by the add-on (Preview Set) and baked per set as `<set>_Line##`.
+    """
+    sub = add_text("Subtitles", "", size=0.10)
     try:
         sub.data.name = "Subtitles"
     except Exception:
         pass
     sub.data.align_x = 'CENTER'
     sub.data.align_y = 'CENTER'
-    sub.data.size = 0.10
     try:
         sub.data.extrude = 0.008
-    except Exception:
-        pass
-    try:
         sub.data.bevel_depth = 0.0015
-    except Exception:
-        pass
-    try:
         sub.data.resolution_u = 3
     except Exception:
         pass
     sub.parent = cam
+    sub.matrix_parent_inverse.identity()   # in-place, returns None
     sub.location = (0, -0.44, -3.0)
-    sub.data.materials.append(mats['subtitle'])
+    sub.rotation_euler = (0, 0, 0)
+    sub.scale = (1, 1, 1)
+    use_mat(sub, mats['subtitle'])
+    sub["_tw_role"] = "subs"
     sub.tw_enabled = True
     sub.tw_cps = cps
     sub.tw_reveal = 'LINEAR'
-    srt = os.path.join(HERE, "dialogue.srt")
-    n = tw._apply_subtitle_file(sub, srt, scene, replace=True,
-                                insert_clears=False)
-    log(f"imported {n} subtitle cues from dialogue.srt")
-    # the addon's flat import and the branch parser must agree cue by cue
-    # (frames + order); speakers/branches come from the parser.
-    entries = sorted(sub.tw_entries, key=lambda e: e.frame)
-    disp = sb.ordered_cues(cues)
-    if len(entries) != len(disp):
-        raise RuntimeError("SRT/addon cue mismatch: %d entries vs %d parsed"
-                           % (len(entries), len(disp)))
-    cue_info = []
-    for e, (num, start, _end, _text, speakers) in zip(entries, disp):
-        want = scene.frame_start + round(start * FPS)
-        if e.frame != want:
-            raise RuntimeError("cue misaligned: entry f%d vs parsed f%d (%r)"
-                               % (e.frame, want, _text[:24]))
-        cue_info.append((e.frame, tuple(speakers)))
-        log(f"  cue {num} f{e.frame}: {e.text.splitlines()[0][:30]!r}")
-    n_baked = tw.bake_typewriter(sub, scene)
-    if n_baked != len(sub.tw_entries):
-        raise RuntimeError("subtitle bake wrote %d of %d objects"
-                           % (n_baked, len(sub.tw_entries)))
-    log("baked %d subtitle objects (live typing off)" % n_baked)
-    return sub, cue_info
+    sub.tw_source_path = os.path.join(HERE, "dialogue.srt")
+    log("subtitle object ready (cps=%s, content comes from Preview Set)" % cps)
+    return sub
 
 
-def build_menu(scene, cam, mats, story, cues):
-    choices = story.get("choices", {})
+def build_menu(scene, cam, mats):
+    """The choice menu: a PLAIN text object (v2).
+
+    No scale keys any more - the game poses it from story state and Preview
+    Set poses it for the timeline. It rests at scale 0 and is never
+    hide_render'd: UPBGE skips hide_render objects at game conversion.
+    """
     menu = add_text("ChoiceMenu", "", size=0.06)
     menu.parent = cam
+    menu.matrix_parent_inverse.identity()   # in-place, returns None
     menu.location = (0, 0.30, -3.0)
-    menu.data.materials.append(mats['menu'])
-    if choices:
-        menu.data.body = sb.menu_body(
-            next(iter(choices.values()))["options"])
-    # Hidden via scale keys, NOT hide_render/hide_viewport: UPBGE skips
-    # hide_render objects in game conversion entirely ("not in the same
-    # layer ... will not be converted"). The driver resets scale in-game.
+    menu.rotation_euler = (0, 0, 0)
+    use_mat(menu, mats['menu'])
+    menu["_tw_role"] = "menu"
     menu.scale = (0.0, 0.0, 0.0)
-    menu.keyframe_insert("scale", frame=FRAME_START)
-    for ch in choices.values():
-        p = cues[ch["prompt_cue"]]
-        f0 = scene.frame_start + round(p["start"] * FPS)
-        f1 = scene.frame_start + round(p["end"] * FPS)
-        for f, s in ((f0, 1.0), (f1, 0.0)):
-            menu.scale = (s, s, s)
-            menu.keyframe_insert("scale", frame=f)
+    menu.tw_enabled = False      # never let the typing handler touch it
     ad = menu.animation_data
     if ad is not None and ad.action is not None:
-        ad.action.name = "ChoiceMenu_anim"
-        for fc in tw._action_fcurves(ad.action):
-            if fc.data_path == "scale":
-                for k in fc.keyframe_points:
-                    k.interpolation = 'CONSTANT'
-                fc.update()
-    log("choice menu done (%d choice(s))" % len(choices))
+        log("NOTE: unassigning the v1 menu action '%s' (the menu is plain in "
+            "v2 - keys are not deleted)" % ad.action.name)
+        ad.action = None
+    log("choice menu done (plain object, scale-0 rest)")
     return menu
 
 
-def build_markers(scene, story, cues):
-    marks = {}
-    for name, f in sb.marker_frames(story, cues, FPS,
-                                    FRAME_START).items():
-        marks.setdefault(f, []).append(name)
-    for f in sorted(marks):
-        scene.timeline_markers.new("+".join(marks[f]), frame=f)
-    log("markers done: %s"
-        % ", ".join("%s@%d" % (n, f) for f in sorted(marks)
-                    for n in marks[f]))
-
-
 # --------------------------------------------------------------------------
-# animation
+# per-set local-timed animation
 # --------------------------------------------------------------------------
 
-def set_mouth(mouth, is_open, f):
-    if is_open:
-        mouth.scale = (0.30, 0.05, 0.16)
-    else:
-        mouth.scale = (0.34, 0.05, 0.035)
-    mouth.keyframe_insert("scale", frame=f)
+def cue_state(plan, t):
+    """(speakers, seconds since the cue started) at set-local time t."""
+    idx = -1
+    for i, (st, _en, _tx) in enumerate(plan["subs"]):
+        if st <= t + 1e-9:
+            idx = i
+    if idx < 0:
+        return [], 0.0
+    st, _en, text = plan["subs"][idx]
+    return sb.speakers_of(text), max(0.0, t - st)
 
 
-def animate(scene, rig_c, rig_s, cue_info):
-    TAU = 2.0 * math.pi
+def key_root(obj, name, plan, f0, f1):
+    """Idle bob + a talk pop on the cue attack (v1's math, set-local time)."""
+    rest, base_z, phase = ROOT_BASE[name]
 
-    def speakers_at(f):
-        idx = 0
-        for i, (s, _sp) in enumerate(cue_info):
-            if s <= f:
-                idx = i
-        return idx, cue_info[idx][1]
-
-    for f in range(FRAME_START, FRAME_END + 1):
-        t = (f - 1) / FPS
-        idx, sp = speakers_at(f)
-        c_talk = "CUBY" in sp
-        s_talk = "SPHERO" in sp
-        since = f - cue_info[idx][0]
-        # roots
-        for rig, base_z, phase, talking in (
-                (rig_c, 0.0, 0.0, c_talk),
-                (rig_s, 0.12, 2.1, s_talk)):
-            root = rig["root"]
+    def poser(o):
+        for f in range(f0, f1 + 1):
+            t = (f - f0) / FPS
+            sp, since_s = cue_state(plan, t)
+            talking = SPEAKER_OF[name] in sp
+            since = int(round(since_s * FPS))
             bob = 0.05 * math.sin(TAU * 1.2 * t + phase)
             if talking:
                 bob += 0.03 * math.sin(TAU * 3.0 * t)
                 if since <= 12:
                     bob += math.sin(math.pi * since / 12.0) * 0.16
-            root.location = (root.location.x, root.location.y,
-                             base_z + bob)
+            o.location = (rest[0], rest[1], base_z + bob)
             pop = 1.0
             if talking and since <= 8:
                 pop += math.sin(math.pi * since / 8.0) * 0.06
-            root.scale = (pop, pop, pop)
-            root.keyframe_insert("location", frame=f)
-            root.keyframe_insert("scale", frame=f)
-        # mouths
-        flap_c = 0.5 + 0.5 * math.sin(TAU * 7.0 * t)
-        flap_s = 0.5 + 0.5 * math.sin(TAU * 6.3 * t + 1.3)
-        set_mouth(rig_c["mouth"], c_talk and flap_c > 0.45, f)
-        set_mouth(rig_s["mouth"], s_talk and flap_s > 0.45, f)
-        # waving arms
-        for rig, talking in ((rig_c, c_talk), (rig_s, s_talk)):
+            o.scale = (pop, pop, pop)
+            o.keyframe_insert("location", frame=f)
+            o.keyframe_insert("scale", frame=f)
+    return poser
+
+
+def key_mouth(obj, name, plan, f0, f1):
+    """Flap while this robot talks (square wave off a sine, as in v1)."""
+    hz, phase = FLAP[SPEAKER_OF[name]]
+    rest = MOUTH_REST[name]
+
+    def poser(o):
+        for f in range(f0, f1 + 1):
+            t = (f - f0) / FPS
+            sp, _since = cue_state(plan, t)
+            talking = SPEAKER_OF[name] in sp
+            flap = 0.5 + 0.5 * math.sin(TAU * hz * t + phase)
+            o.scale = MOUTH_OPEN if (talking and flap > 0.45) else rest
+            o.keyframe_insert("scale", frame=f)
+    return poser
+
+
+def key_arm(obj, name, plan, f0, f1):
+    """Wave the right arm while talking."""
+    ry = ARM_REST_RY[name]
+
+    def poser(o):
+        for f in range(f0, f1 + 1):
+            t = (f - f0) / FPS
+            sp, _since = cue_state(plan, t)
+            talking = SPEAKER_OF[name] in sp
             swing = 0.7 * math.sin(TAU * 3.0 * t) if talking else 0.0
-            rig["arm_r"].rotation_euler = (swing, rig["arm_r_ry"], 0.0)
-            rig["arm_r"].keyframe_insert("rotation_euler", frame=f)
-        # blinking (offset per character)
-        for eyes, off in ((rig_c["eyes"], 0), (rig_s["eyes"], 40)):
-            blinking = ((f + off) % 84) < 3
-            for w in eyes:
-                w.scale = (1.0, 1.0, 0.12 if blinking else 1.0)
-                w.keyframe_insert("scale", frame=f)
-        if f % 60 == 0:
-            log(f"animated frame {f}/{FRAME_END}")
-    for o in (rig_c["root"], rig_s["root"], rig_c["mouth"],
-              rig_s["mouth"], rig_c["arm_r"], rig_s["arm_r"],
-              *rig_c["eyes"], *rig_s["eyes"]):
-        ad = o.animation_data
-        if ad is not None and ad.action is not None:
-            ad.action.name = o.name + "_anim"
-    log("animation done")
+            o.rotation_euler = (swing, ry, 0.0)
+            o.keyframe_insert("rotation_euler", frame=f)
+    return poser
+
+
+def key_blink(obj, name, phase_off, f0, f1):
+    """Periodic blink - ambience, so it is NOT a story anim (see build_blinks)."""
+    def poser(o):
+        for f in range(f0, f1 + 1):
+            blinking = ((f + phase_off) % BLINK_PERIOD) < BLINK_FRAMES
+            o.scale = (1.0, 1.0, 0.12 if blinking else 1.0)
+            o.keyframe_insert("scale", frame=f)
+    return poser
+
+
+POSE_FOR = {}
+for _n in ROOT_BASE:
+    POSE_FOR[_n] = key_root
+for _n in MOUTH_REST:
+    POSE_FOR[_n] = key_mouth
+for _n in ARM_REST_RY:
+    POSE_FOR[_n] = key_arm
+
+
+def set_frame_span(story, files, set_name):
+    """(f0, f1) a set occupies: its local timeline, so it always starts at 1.
+
+    Derived from the story (blocking subs + action ranges), never hardcoded:
+    main -> 1..361, cuby -> 1..91, sphero -> 1..133.
+    """
+    plan = sb.set_plan(story, files, set_name, {}, FPS)
+    return FRAME_START, FRAME_START + int(round(sb.set_duration(plan) * FPS))
+
+
+def build_set_actions(story, files, scene):
+    """One local-timed starter action per (set, actor) named in story.yml.
+
+    The action list comes FROM story.yml (not from a hardcoded table), so
+    adding `- action: CubyHat@main__cubyhat` to a set makes the next build
+    create it. Existing actions are left untouched.
+    """
+    created, kept, unknown = [], [], []
+    for set_name in sorted(story.get("sets") or {}):
+        f0, f1 = set_frame_span(story, files, set_name)
+        plan = sb.set_plan(story, files, set_name, {}, FPS)
+        for (obj_name, act_name, at, _wait, _dur) in plan["actions"]:
+            obj = scene.objects.get(obj_name)
+            if obj is None:
+                unknown.append("%s (object missing)" % obj_name)
+                continue
+            maker = POSE_FOR.get(obj_name)
+            if maker is None:
+                unknown.append("%s (no pose rule - author it by hand)"
+                               % obj_name)
+                continue
+            act, new = ensure_action(
+                obj, act_name, maker(obj, obj_name, plan, f0, f1))
+            (created if new else kept).append("%s [%d,%d]"
+                                              % (act_name, f0, f1))
+        log("set '%s': frames %d-%d" % (set_name, f0, f1))
+    log("set actions: %d created, %d kept as-is" % (len(created), len(kept)))
+    for u in unknown:
+        log("  WARNING: " + u)
+    return created, kept, unknown
+
+
+def build_blinks(story, files):
+    """One always-assigned blink action per eye.
+
+    story.yml lists root/mouth/arm per set; blinking is ambience that should
+    run in every set, so each eye keeps a single long periodic action of its
+    own instead of a per-set one. It plays on the timeline because it stays
+    assigned; the game driver only starts actions story.yml names, so this is
+    timeline-only charm - exactly as in v1.
+    """
+    longest = FRAME_START
+    for set_name in (story.get("sets") or {}):
+        _f0, f1 = set_frame_span(story, files, set_name)
+        longest = max(longest, f1)
+    made = 0
+    for speaker, names in sorted(EYES.items()):
+        for i, name in enumerate(names):
+            obj = bpy.data.objects.get(name)
+            if obj is None:
+                continue
+            _act, new = ensure_action(
+                obj, "%s_blink" % name,
+                key_blink(obj, name, i * 7 + (0 if speaker == "CUBY" else 40),
+                          FRAME_START, longest))
+            made += 1 if new else 0
+    log("blink actions: %d created (span 1-%d, not story anims)"
+        % (made, longest))
 
 
 # --------------------------------------------------------------------------
-# UPBGE game logic
+# UPBGE game logic (idempotent bricks)
 # --------------------------------------------------------------------------
+
+GAME_SENSOR = 'Always'
+GAME_CTRL = 'Dialogue'
+GAME_MODULE = 'game_subtitles.update'
+GAME_TEXT = 'game_subtitles.py'
+STORY_PROP = 'tw_story'
+STORY_VALUE = '//story.yml'
+# Game property strings are length-capped in UPBGE, so only PATHS live in
+# them - never JSON. And the `Text` property is CREATE-ONLY from bpy: writing
+# `prop.value` on a Text game property corrupts UPBGE 0.50 state and segfaults
+# later (bisected over ~10 probes). The game driver rewrites those values
+# every tick through the KX path, which is safe.
+TEXT_PROP = 'Text'
+CREATE_ONLY_PROPS = (("Subtitles", TEXT_PROP), ("ChoiceMenu", TEXT_PROP))
+
+
+def _ensure_brick(op_add, kind, name, obj, **kwargs):
+    """Create a logic brick only if it is missing (a rebuild must not stack
+    duplicate sensors/controllers)."""
+    try:
+        coll = obj.game.sensors if kind == 'sensor' else obj.game.controllers
+        if coll.get(name) is not None:
+            return coll.get(name), False
+    except Exception:
+        return None, False
+    prev = bpy.context.view_layer.objects.active
+    try:
+        try:
+            op_add(object=obj.name, name=name, **kwargs)
+        except TypeError:
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            op_add(name=name, **kwargs)
+    finally:
+        try:
+            bpy.context.view_layer.objects.active = prev
+        except Exception:
+            pass
+    try:
+        coll = obj.game.sensors if kind == 'sensor' else obj.game.controllers
+        return coll.get(name), True
+    except Exception:
+        return None, True
+
+
+def _ensure_string_prop(obj, name, value=None):
+    """Create a STRING game property; only set `value` when explicitly given
+    (never for the create-only Text properties - see the warning above)."""
+    try:
+        props = obj.game.properties
+    except Exception:
+        return False
+    if props.get(name) is not None:
+        if value is not None:
+            try:
+                props[name].value = value
+            except Exception:
+                return False
+        return True
+    prev = bpy.context.view_layer.objects.active
+    saved = (obj.hide_viewport, obj.hide_render)
+    try:
+        # the op refuses hidden objects (the menu rests at scale 0 / hidden)
+        obj.hide_viewport = False
+        obj.hide_render = False
+        bpy.context.view_layer.objects.active = obj
+        try:
+            bpy.ops.object.game_property_new(type='STRING', name=name)
+        except TypeError:
+            before = set(p.name for p in props)
+            bpy.ops.object.game_property_new()
+            fresh = [p for p in props if p.name not in before]
+            if not fresh:
+                return False
+            try:
+                fresh[0].name = name
+                fresh[0].type = 'STRING'
+            except Exception:
+                pass
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        obj.hide_viewport, obj.hide_render = saved
+        try:
+            bpy.context.view_layer.objects.active = prev
+        except Exception:
+            pass
+    if value is not None and props.get(name) is not None:
+        try:
+            props[name].value = value
+        except Exception:
+            return False
+    return props.get(name) is not None
+
 
 def build_game():
+    """GameDirector: Always(pulse) -> Python(MODULE game_subtitles.update)."""
     try:
-        log("game: add empty")
-        bpy.ops.object.empty_add(location=(0, 0, 0))
-        d = bpy.context.active_object
-        d.name = "GameDirector"
-        log("game: add sensor")
+        d = bpy.data.objects.get("GameDirector")
+        if d is None:
+            bpy.ops.object.empty_add(location=(0, 0, 0))
+            d = bpy.context.active_object
+            d.name = "GameDirector"
+            log("game: GameDirector created")
+        sens, s_new = _ensure_brick(bpy.ops.logic.sensor_add, 'sensor',
+                                    GAME_SENSOR, d, type='ALWAYS')
+        if sens is None:
+            log("GAME SETUP FAILED: no Always sensor")
+            return False
         try:
-            bpy.ops.logic.sensor_add(type='ALWAYS', name='Always',
-                                     object='GameDirector')
-        except TypeError:
-            bpy.context.view_layer.objects.active = d
-            d.select_set(True)
-            bpy.ops.logic.sensor_add(type='ALWAYS', name='Always')
-        log("game: add controller")
-        try:
-            bpy.ops.logic.controller_add(type='PYTHON', name='Dialogue',
-                                         object='GameDirector')
-        except TypeError:
-            bpy.context.view_layer.objects.active = d
-            d.select_set(True)
-            bpy.ops.logic.controller_add(type='PYTHON', name='Dialogue')
-        log("game: configure bricks")
-        sens = d.game.sensors['Always']
-        if hasattr(sens, 'use_pulse_true_level'):
-            sens.use_pulse_true_level = True
-        ctrl = d.game.controllers['Dialogue']
+            if hasattr(sens, 'use_pulse_true_level'):
+                sens.use_pulse_true_level = True
+        except Exception:
+            pass
+        ctrl, c_new = _ensure_brick(bpy.ops.logic.controller_add, 'controller',
+                                    GAME_CTRL, d, type='PYTHON')
+        if ctrl is None:
+            log("GAME SETUP FAILED: no Python controller")
+            return False
         ctrl.mode = 'MODULE'
-        ctrl.module = 'game_subtitles.update'
+        ctrl.module = GAME_MODULE
         try:
             sens.link(ctrl)
         except Exception as ex:
-            log(f"sensor link note: {ex}")
+            log("game: sensor link note: %s" % ex)
+        # the driver is embedded as a text block so MODULE resolves in-game
         with open(os.path.join(HERE, 'game_subtitles.py'),
                   encoding='utf-8') as fh:
             code = fh.read()
-        txt = bpy.data.texts.new('game_subtitles.py')
-        txt.from_string(code)
-        log("game: dialogue data property")
-        prev = bpy.context.view_layer.objects.active
-        try:
-            targets = []
-            for oname, pname in (("Subtitles", "Text"),
-                                 ("ChoiceMenu", "Text"),
-                                 ("GameDirector", "tw_story")):
-                o = bpy.data.objects.get(oname)
-                if o is not None and o.game.properties.get(pname) is None:
-                    targets.append((o, pname))
-            # the op refuses hidden objects (the menu hides at frame 1)
-            saved_hide = [(o, o.hide_viewport, o.hide_render)
-                          for (o, _p) in targets]
-            try:
-                for (o, _p) in targets:
-                    o.hide_viewport = False
-                    o.hide_render = False
-                for (o, pname) in targets:
-                    bpy.context.view_layer.objects.active = o
-                    bpy.ops.object.game_property_new(type='STRING',
-                                                     name=pname)
-            finally:
-                for (o, hv, hr) in saved_hide:
-                    o.hide_viewport = hv
-                    o.hide_render = hr
-            gp = d.game.properties["tw_story"]
-            gp.value = "//story.yml"
-            log("game: tw_story points at %s" % gp.value)
-        finally:
-            try:
-                bpy.context.view_layer.objects.active = prev
-            except Exception:
-                pass
-        log("game logic bricks + embedded script installed "
-            f"(sensors={len(d.game.sensors)}, controllers="
-            f"{len(d.game.controllers)})")
+        txt = bpy.data.texts.get(GAME_TEXT)
+        if txt is None:
+            txt = bpy.data.texts.new(GAME_TEXT)
+        if txt.as_string() != code:
+            txt.from_string(code)
+            log("game: embedded %s refreshed" % GAME_TEXT)
+        if not _ensure_string_prop(d, STORY_PROP, STORY_VALUE):
+            log("GAME SETUP FAILED: no %s property" % STORY_PROP)
+            return False
+        for oname, pname in CREATE_ONLY_PROPS:
+            o = bpy.data.objects.get(oname)
+            if o is None:
+                log("game: WARNING %s is missing (no %s property)"
+                    % (oname, pname))
+                continue
+            if not _ensure_string_prop(o, pname, None):   # never write Text
+                log("game: WARNING could not create %s.%s" % (oname, pname))
+        log("game: bricks ready (sensor %s, controller %s, %s=%s, "
+            "create-only Text props on Subtitles/ChoiceMenu)"
+            % ("created" if s_new else "reused",
+               "created" if c_new else "reused", STORY_PROP, STORY_VALUE))
         return True
     except Exception:
         import traceback
@@ -706,31 +912,38 @@ def build_game():
 
 
 def embed_readme():
-    txt = bpy.data.texts.new('README')
-    txt.from_string(
-        "TALKING ROBOTS - 3D typewriter subtitles demo (story sets + actors)\n"
-        "=================================================================\n\n"
+    txt = bpy.data.texts.get('README')
+    if txt is None:
+        txt = bpy.data.texts.new('README')
+    body = (
+        "TALKING ROBOTS - 3D typewriter subtitles demo (story sets, v2)\n"
+        "==============================================================\n\n"
         "1) Install the addon: Edit > Preferences > Add-ons > Install...\n"
-        "   pick typewriter_subtitles.py, enable 'Typewriter Subtitles'.\n\n"
-        "2) TIMELINE MODE: press Spacebar. Subtitles type live on the\n"
-        "   baked per-cue text objects (no addon needed); the\n"
-        "   camera plays the baked Camera_anim action. Markers\n"
-        "   SET-main/SET-cuby/SET-sphero/CH-pick mark the story sets -\n"
-        "   select 'Subtitles' > Sidebar (N) > Subtitles > 'Jump to\n"
-        "   Set' to preview each one. Edit dialogue.srt externally,\n"
-        "   then Import/Reload it and press Bake to Objects.\n\n"
-        "3) GAME MODE: press P. The driver reads story.yml +\n"
-        "   dialogue.srt live, plays each actor's action, types the\n"
-        "   lines. Choose with Up/Down+Enter (or 1/2), R restarts,\n"
-        "   ESC quits. game_debug.log (next to the .blend) records\n"
-        "   sets, choices and actors - proof the logic ran.\n\n"
-        "4) Render: F12 still / Ctrl+F12 animation (PNG sequence in\n"
-        "   ./render/). Subtitles are baked keys, so renders need no addon.\n\n"
-        "Files next to this .blend: story.yml (sets/actors/choices),\n"
-        "dialogue.srt (subtitle text + [CAM] shot plan),\n"
-        "game_subtitles.py (external copy of the embedded game script),\n"
-        "story.py (story parser), typewriter_subtitles.py (the addon).\n"
-        "Tweak keys, retime cues, rewire sets - then press P.\n")
+        "   pick typewriter_subtitles.py (v1.9.0), enable it.\n\n"
+        "2) TIMELINE MODE: press Spacebar. The file opens on the START set\n"
+        "   (main, frames 1-361) with its subtitles baked to main_Line##\n"
+        "   objects, so it plays and renders with no addon at all. To work\n"
+        "   on another set: select Subtitles > Sidebar (N) > Story Sets >\n"
+        "   'Preview Set...' - that assigns the set's actions, loads its\n"
+        "   .srt cues, sets the frame range, snaps the camera to the\n"
+        "   opening shot and poses the choice menu.\n\n"
+        "3) GAME MODE: press P. game_subtitles.py reads story.yml + the\n"
+        "   .srt files live, plays each set's actions from t=0, moves the\n"
+        "   camera between the staged shots and types the lines. Choose\n"
+        "   with Up/Down+Enter (or 1/2), R restarts, ESC quits.\n"
+        "   game_debug.log (next to the .blend) records sets and choices.\n\n"
+        "4) EDIT: tweak any key, retime any cue, rewire any set - then\n"
+        "   press P. No rebuild. After renaming an object or action the\n"
+        "   Story panel lists the pending rename; Apply rewrites story.yml.\n"
+        "   'Refresh Sync' rewrites story.sync.json + story.schema.json\n"
+        "   (also done automatically on save).\n\n"
+        "Files next to this .blend: story.yml (sets/anims/choices),\n"
+        "story.py (parser), story.sync.json (action ranges + rename map),\n"
+        "story.schema.json (editor completion), dialogue.srt / cuby.srt /\n"
+        "sphero.srt (per-set subtitle text + [CAM] shots),\n"
+        "game_subtitles.py (game driver), typewriter_subtitles.py (addon).\n")
+    if txt.as_string() != body:
+        txt.from_string(body)
 
 
 def purge_orphans():
@@ -744,29 +957,86 @@ def purge_orphans():
                 pass
 
 
+# --------------------------------------------------------------------------
+
+def check_ranges(scene):
+    """Assert the build produced exactly the action ranges the story expects.
+
+    The game divides a blocking action's range by fps to know when a set ends,
+    so a wrong range is a wrong story - fail the build rather than ship it.
+    """
+    sp = os.path.join(HERE, "story.yml")
+    side = sb.load_sidecar(sb.sync_path_for(sp))
+    bad = []
+    for set_name, want_f1 in sorted(WANT_RANGES.items()):
+        for name, rng in sorted(side["actions"].items()):
+            if not name.startswith(set_name + "__"):
+                continue
+            if list(rng) != [FRAME_START, want_f1]:
+                bad.append("%s = %s (want [1, %d])" % (name, rng, want_f1))
+    if bad:
+        raise RuntimeError("action ranges are wrong:\n  " + "\n  ".join(bad))
+    log("action ranges verified: %s"
+        % ", ".join("%s__* [1,%d]" % (s, f)
+                    for s, f in sorted(WANT_RANGES.items())))
+    return side
+
+
 def main():
     global FRAME_END
     if not hasattr(bpy.types.Object, "tw_entries"):
         tw.register()
     log("addon active: v%s"
         % ".".join(str(x) for x in tw.bl_info.get("version", ())))
-    loaded = sb.load_story_files(os.path.join(HERE, "story.yml"))
+    story_path = os.path.join(HERE, "story.yml")
+    loaded = sb.load_story_files(story_path)
     if loaded["errors"]:
-        raise RuntimeError("story errors:\n- "
-                           + "\n- ".join(loaded["errors"]))
+        raise RuntimeError("story errors:\n- " + "\n- ".join(loaded["errors"]))
     for w in loaded["warnings"]:
         log("story warning: " + w)
-    story, cues, cams = loaded["story"], loaded["cues"], loaded["cams"]
-    last_end = max(c["end"] for c in cues.values())
-    FRAME_END = int(round(last_end * FPS)) + FPS
-    rng_errs = sb.validate_story(story, cues, FRAME_START, FRAME_END)
-    if rng_errs:
-        raise RuntimeError("story errors:\n- " + "\n- ".join(rng_errs))
-    log("story: %d cues, sets %s; frames %d-%d"
-        % (len(cues), ", ".join(sorted(story["sets"])), FRAME_START,
-           FRAME_END))
+    story, files = loaded["story"], loaded["files"]
+    start = story.get("start")
+    # ADDITIVE: a rebuild tops up the existing file instead of starting from a
+    # blank factory scene, so hand-tweaked keys and stamped uids survive.
+    # TW_FRESH=1 forces a from-scratch regeneration instead.
+    #
+    # The file has to be loaded as a command-line ARGUMENT, not with
+    # bpy.ops.wm.open_mainfile(): on UPBGE 0.50 that call inside a UI session
+    # segfaults at teardown (probed - open + quit with nothing else in between
+    # exits 139, and game_property_new after it hangs), while the same file
+    # passed as an argument builds, saves and quits cleanly. So re-run.
+    blend = os.path.abspath(os.path.join(HERE, "talking_robots.blend"))
+    loaded_ok = (os.path.abspath(bpy.data.filepath or "") == blend)
+    if (os.path.isfile(blend) and not loaded_ok
+            and not os.environ.get("TW_FRESH")
+            and not os.environ.get("TW_BUILD_CHILD")):
+        log("additive build: re-running with %s loaded"
+            % os.path.basename(blend))
+        env = dict(os.environ, TW_BUILD_CHILD="1")
+        # bpy.app.binary_path, NOT sys.executable: in UPBGE the latter is the
+        # bundled python3.11, which would try to run the .blend as a script
+        exe = bpy.app.binary_path or sys.argv[0]
+        rc = subprocess.call([exe, blend, "--python",
+                              os.path.abspath(__file__)], env=env, cwd=HERE)
+        log("additive build finished (exit %d)" % rc)
+        if rc != 0:
+            os._exit(rc)        # nothing was built here; propagate the failure
+        bpy.ops.wm.quit_blender()
+        return
+    if os.path.isfile(blend) and not loaded_ok:
+        log("rebuilding from scratch (%s will be overwritten)"
+            % ("TW_FRESH set" if os.environ.get("TW_FRESH")
+               else "no existing file"))
+    if start not in (story.get("sets") or {}):
+        raise RuntimeError("story 'start' names no set: %r" % (start,))
+    scene = bpy.context.scene
+    # the file opens on the start set; Preview Set at the end sets it exactly
+    _f0, FRAME_END = set_frame_span(story, files, start)
+    log("story: %d sets (%s), %d choices, start '%s', frames %d-%d"
+        % (len(story["sets"]), ", ".join(sorted(story["sets"])),
+           len(story.get("choices") or {}), start, FRAME_START, FRAME_END))
+
     random.seed(7)
-    clear_scene()
     setup_scene()
     mats = {
         'cuby': make_mat("CubyBlue", (0.16, 0.42, 0.90), 0.55),
@@ -796,29 +1066,85 @@ def main():
         'tag_orange': make_mat("TagOrange", (1.0, 0.85, 0.6), 0.5,
                                (1.0, 0.55, 0.15), 0.8),
     }
-    scene = bpy.context.scene
-    cam = build_lights_camera(cues, cams)
+    cam = build_lights_camera()
     build_set(mats)
-    rig_c = build_cuby(mats)
-    rig_s = build_sphero(mats)
-    sub, cue_info = build_subtitles(scene, cam, mats, cues,
-                                      story.get("cps", CPS))
-    build_menu(scene, cam, mats, story, cues)
-    build_markers(scene, story, cues)
-    animate(scene, rig_c, rig_s, cue_info)
-    log("step: frame reset")
-    scene.frame_set(FRAME_START)
+    build_cuby(mats)
+    build_sphero(mats)
+    sub = build_subtitles(scene, cam, mats, story.get("cps", CPS))
+    build_menu(scene, cam, mats)
+    apply_rest_poses()
     bpy.context.view_layer.update()
+    log("step: per-set actions")
+    build_set_actions(story, files, scene)
+    build_blinks(story, files)
+    apply_rest_poses()          # keying left the objects mid-gesture
     log("step: game")
     game_ok = build_game()
     log("step: readme")
     embed_readme()
     log("step: purge")
     purge_orphans()
+    log("step: auto-preview the start set")
+    baked_here = [o for o in scene.objects if o.get(tw._BAKE_TAG) == start]
+    if (scene.tw_preview_set == start and len(sub.tw_entries)
+            and len(baked_here) == len(sub.tw_entries)):
+        # Already sitting on the start set with a matching bake: leave the
+        # frame range, the assigned actions, the loaded cues AND the baked
+        # reveal keys alone. Re-previewing would rebuild SubtitlesAction and
+        # silently discard hand-retimed subtitle timing.
+        log("already previewing set '%s' (%d cue(s), %d baked object(s)) - "
+            "kept as-is" % (start, len(sub.tw_entries), len(baked_here)))
+    else:
+        ok, msg, info = tw.preview_set_impl(scene, start)
+        log("preview: %s" % msg)
+        if not ok:
+            raise RuntimeError("auto-preview failed: %s" % msg)
+        # bakes of OTHER sets would double up on screen: the shipped file
+        # shows the start set's subtitles only (bakes are derived data)
+        for o in [o for o in list(scene.objects)
+                  if o.get(tw._BAKE_TAG) not in (None, start)]:
+            log("removing stale bake '%s' (set '%s')"
+                % (o.name, o.get(tw._BAKE_TAG)))
+            data = o.data
+            bpy.data.objects.remove(o, do_unlink=True)
+            if data is not None and data.users == 0:
+                bpy.data.curves.remove(data)   # else an orphan steals the name
+        old_bake = [o for o in scene.objects if o.get(tw._BAKE_TAG) == start]
+        if old_bake and len(old_bake) == len(sub.tw_entries):
+            # a rebuild must not throw away a bake the user re-timed by hand
+            log("bake for set '%s' already present (%d object(s)) - kept as-is"
+                % (start, len(old_bake)))
+        else:
+            n_baked = tw.bake_typewriter(sub, scene, prefix="%s_Line" % start,
+                                         tag=start)
+            if n_baked <= 0:
+                raise RuntimeError("baking set '%s' produced no objects"
+                                   % start)
+            log("baked %d subtitle object(s) as %s_Line##" % (n_baked, start))
+    log("step: refresh sync (story.sync.json + story.schema.json)")
+    ok, msgs, _info = tw.refresh_sync_impl(scene)
+    for m in msgs:
+        log("sync: " + m)
+    if not ok:
+        raise RuntimeError("Refresh Sync failed: %s" % "; ".join(msgs))
+    check_ranges(scene)
+    errs, warns, binds, summary = tw.validate_impl(scene)
+    log("validate: " + summary)
+    for e in errs + binds:
+        log("  ERROR: " + e)
+    for w in warns:
+        log("  warning: " + w)
+    if errs or binds:
+        raise RuntimeError("the built scene does not validate:\n- "
+                           + "\n- ".join(errs + binds))
+    scene.frame_set(FRAME_START)
+    bpy.context.view_layer.update()
     log("step: save")
     out = os.path.join(HERE, "talking_robots.blend")
     bpy.ops.wm.save_as_mainfile(filepath=out)
-    log(f"SAVED {out} (game={'OK' if game_ok else 'FAILED'})")
+    log("SAVED %s (game=%s, sets=%d, actions=%d, objects=%d)"
+        % (out, "OK" if game_ok else "FAILED", len(story["sets"]),
+           len(bpy.data.actions), len(scene.objects)))
     try:
         if not bpy.app.background:
             bpy.ops.wm.quit_blender()
