@@ -1,3 +1,11 @@
 *.blend1
 __pycache__/
 *.pyc
+
+# test/run artifacts (generated, never authored)
+persist_*.blend
+*_capture.blend
+game_debug.log
+tw_game_debug.log
+capture/
+render/

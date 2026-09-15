@@ -470,6 +470,33 @@ def parse_minimal_yaml(text):
 # animation references
 # --------------------------------------------------------------------------
 
+def normalize_story(story):
+    """Fill in childless keys so consumers cannot trip over None.
+
+    A bare `sets:` (nothing indented under it) parses to None, and
+    `story.get("sets", {})` then returns None rather than the default - so
+    every walk of the story would raise AttributeError on a file the author
+    is still editing. Only None is replaced: a WRONG type is left alone so
+    check_story() can report it properly.
+    """
+    if not isinstance(story, dict):
+        return story
+    for key in ("sets", "choices"):
+        if key in story and story[key] is None:
+            story[key] = {}
+    sets = story.get("sets")
+    if isinstance(sets, dict):
+        for s in sets.values():
+            if isinstance(s, dict) and s.get("anims") is None:
+                s["anims"] = []
+    choices = story.get("choices")
+    if isinstance(choices, dict):
+        for ch in choices.values():
+            if isinstance(ch, dict) and ch.get("options") is None:
+                ch["options"] = []
+    return story
+
+
 def parse_subs_ref(value):
     """'file.srt#a-b' / 'file.srt#N' -> (file, a, b, error)."""
     if not isinstance(value, str):
@@ -700,7 +727,7 @@ def _loop_checks(story, anims_of):
     """Instant-loop detection: a goto cycle with no blocking set and no
     choice/stop inside would hang the game on one tick."""
     errs = []
-    sets = story.get("sets", {})
+    sets = story.get("sets") or {}
     for name in sets:
         seen = []
         cur = name
@@ -812,7 +839,7 @@ def check_bindings(story, objects, actions, cameras):
     """
     errs = []
     objects, actions, cameras = set(objects), set(actions), set(cameras)
-    for name, s in story.get("sets", {}).items():
+    for name, s in (story.get("sets") or {}).items():
         if not isinstance(s, dict):
             continue
         for i, e in enumerate(s.get("anims", [])):
@@ -848,7 +875,7 @@ def _gather_refs(story):
     subs, audio = set(), set()
     if not isinstance(story, dict):
         return subs, audio
-    for s in story.get("sets", {}).values():
+    for s in (story.get("sets") or {}).values():
         if not isinstance(s, dict):
             continue
         for e in s.get("anims", []):
@@ -881,7 +908,7 @@ def load_story_files(story_path):
              "files": {}, "audio": {}}
     try:
         with open(story_path, encoding="utf-8-sig") as fh:
-            story = parse_minimal_yaml(fh.read())
+            story = normalize_story(parse_minimal_yaml(fh.read()))
     except OSError as ex:
         blank["errors"] = ["cannot read %s (%s)" % (story_path, ex)]
         return blank
@@ -1058,7 +1085,7 @@ def build_schema(story, objects, actions, cameras, srt_files, audio_files):
     objects/actions/cameras/srt_files/audio_files are name lists from the
     live scene + project scan. Regenerate on save to keep enums fresh.
     """
-    sets = sorted(str(k) for k in story.get("sets", {}))
+    sets = sorted(str(k) for k in (story.get("sets") or {}))
     choices = sorted(str(k) for k in (story.get("choices") or {}))
     anim_short = {
         "type": "string",

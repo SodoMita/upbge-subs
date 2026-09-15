@@ -338,4 +338,30 @@ addon_stripped = "\n".join(ln for ln in multi.split("\n")
 assert addon_stripped == story.strip_directives(multi)
 print("addon strip parity ok")
 
+# 14) a half-written story.yml must REPORT errors, never crash. A childless
+# key parses to None and `story.get("sets", {})` returns None (the key
+# exists), so every walker used to raise AttributeError before check_story
+# could say what was actually wrong.
+assert story.parse_minimal_yaml("start: nope\nsets:\n") == {
+    "start": "nope", "sets": None}
+assert story.normalize_story({"sets": None, "choices": None}) == {
+    "sets": {}, "choices": {}}
+assert story.normalize_story(
+    {"sets": {"a": {"anims": None}}})["sets"]["a"]["anims"] == []
+assert story.normalize_story({"sets": "wrong type"})["sets"] == "wrong type", \
+    "a wrong type must survive so check_story can report it"
+FIX = tempfile.mkdtemp(prefix="twhalf")
+open(os.path.join(FIX, "half.yml"), "w").write("start: nope\nsets:\n")
+res = story.load_story_files(os.path.join(FIX, "half.yml"))
+assert res["errors"] and "'sets' must be a non-empty mapping" in res["errors"][0], \
+    res["errors"]
+open(os.path.join(FIX, "half2.yml"), "w").write(
+    "start: a\nsets:\n  a:\n    anims:\n    end: choice c\n"
+    "choices:\n  c:\n    prompt: x.srt#1\n    options:\n")
+res2 = story.load_story_files(os.path.join(FIX, "half2.yml"))
+assert res2["errors"], res2
+assert any("anims" in e for e in res2["errors"]), res2["errors"]
+shutil.rmtree(FIX, ignore_errors=True)
+print("half-written story ok")
+
 print("ALL STORY TESTS PASSED")
