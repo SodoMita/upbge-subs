@@ -13,51 +13,56 @@ For the next agent session. Read this first, then `README.md`, then `story.yml`.
 - `talking_robots.blend` — the demo scene (two robot actors, staged cams).
 - Target engine: **UPBGE 0.50 (Blender 5.0.1)**, Linux x64.
 
-## Current state (2026-09-15): v2 migration HALF DONE
+## Current state (2026-09-15): v2 migration DONE — all 5 QUEUED items shipped
 
-The v1 master-timeline pipeline (single `dialogue.srt`, absolute frames,
-one baked `Camera_anim`, one choice) is being replaced by the v2
-animation-centric pipeline. Status:
+Branch `v2-migration`. Every suite green on UPBGE 0.50 (Blender 5.0.1):
+`test_story.py` / `test_game_logic.py` / `test_tw_game.py` (pure Python),
+`test_addon_story.py` (132 checks), `test_panel_draw.py` (25),
+`test_persistence.py` MODE A/B/C/R + `test_load_repair.py` + `test_ops.py`,
+`resave_game.py` (134 checks), `verify_game.py` (133 checks).
 
-**DONE + tested (pure Python, no Blender needed):**
-- `story.py` v2 — flow-map YAML, `file.srt#a-b` / `file.srt#N` / `Obj@Act`
-  refs, multi-SRT (`.` + `./subtitles/`), audio checks (`./audio/` + `.`),
-  `check_story` + `warn_story` (incl. unreachable-set/choice + instant-loop
-  detection) + `check_bindings`, per-set runtime plans, sidecar/schema builders.
-- `game_subtitles.py` v2 — loads `story.py` from disk, plays anim bundles
-  from t=0, procedural camera (smoothstep + slerp between staged shots,
-  lens followed live), `aud` audio, chained choices, loops, capture mode.
-- Content: `dialogue.srt` (main cues 1–9), `cuby.srt`, `sphero.srt`
-  (rebased to 00:00), v2 `story.yml` (`pick` → `pick2` chain, loop to `main`),
-  starter `story.sync.json` (action ranges — **build must generate these
-  exact ranges**: `main__*` [1,361], `cuby__*` [1,91], `sphero__*` [1,133]).
-- Suites green: `test_story.py`, `test_game_logic.py` (16 sections, incl.
-  real-file integration with loop), `test_tw_game.py` (unchanged, passing).
+1. **Add-on v1.9.0** — Preview Set (set-local frame range, assign/detach set
+   actions, load the set's `.srt` cues, snap the opening shot + lens, pose or
+   park the menu, auto-manage speakers, `tw_preview_set`/`tw_preview_range`
+   indicators), fake-user guard, invisible `_tw_uid` rename watcher (depsgraph
+   diff, pending list, Apply → targeted YAML rewrite, `tw_autorewrite`),
+   Refresh Sync (`story.sync.json` + `story.schema.json`, also on save),
+   validator as text lists only, per-set Bake `<set>_Line##`. Tests pin
+   `_is_directive_line` + `TW_GAME_DRIVER_SOURCE`; both unchanged.
+2. **`build_scene.py` v2** — additive/idempotent: opens the existing
+   `talking_robots.blend` (as a command-line argument, re-exec'ing itself),
+   `ensure_action()` never touches existing keys, `use_mat()`/`prim()`/
+   `add_text()` reuse by name. Per-set local actions derived FROM story.yml,
+   ranges asserted against the pinned spans. Staged cams with their own lens,
+   no camera bake, no markers, plain menu, idempotent bricks, eyes keep shared
+   blink actions, auto-preview + bake of the start set (skipped when already
+   correct, so hand-retimed reveal keys survive). `TW_FRESH=1` = from scratch.
+3. **`resave_game.py`** — v2: per-set plans instead of `loaded["cues"]`,
+   sidecar drift repair via Refresh Sync, fake-user guard, create-if-missing
+   bricks via build_scene's own helpers (its `main()` is `__name__`-guarded so
+   importing does not rebuild), no-Text-write rule kept, generic-driver
+   self-test kept. Verified inert (identical fingerprint across two runs).
+4. **`verify_game.py`** — read-only, previews EVERY set, slot-binding proof
+   per action (depsgraph value must equal what the action keys), sidecar +
+   schema checks, v1-leftover assertions, bake checks, and the build-twice
+   key-survival proof in a throwaway copy of the project.
+5. **Chain + stills + README** — full chain run (build → resave → verify →
+   stills), `make_stills.py` (baked card / typing proof / menu proof / later
+   line), README rewritten for the v2 workflow + schema reference, pushed to
+   branch `v2-migration` with a PR (never straight to main).
 
-**QUEUED (not started):**
-1. **Add-on v2 → 1.9.0** (`typewriter_subtitles.py`): Preview-set operator
-   (assign set actions, load set SRT into entries, frame range, snap opening
-   shot, menu preview, auto-manage speaker objects, `tw_preview_set` scene
-   indicator), fake-user guard for set actions, rename watcher (auto-stamp
-   invisible `tw_uid`, depsgraph name-diff, pending list + Apply button +
-   `tw_autorewrite` toggle, targeted YAML rewrite), Refresh Sync (write
-   `story.sync.json` + `story.schema.json`, also on save), validator panel
-   (errors/warnings/bindings text lists — **no graph rendering, user veto**),
-   Bake to Objects per set (prefix `<set>_Line##`), repurpose Jump to Set.
-   Keep: entries/keys/live typing, import/export, save_pre/post,
-   `setup_game_logic`, `_is_directive_line`, `TW_GAME_DRIVER_SOURCE`
-   (tests pin the last two via AST/extract).
-2. **`build_scene.py` v2**: additive/idempotent (create-if-missing, **never
-   delete actions or keys**), per-set local-timed starter actions matching
-   the sync ranges above, staged cams carrying their own `lens`, NO camera
-   bake (driver is procedural), NO SET-/CH- markers, plain menu object,
-   idempotent bricks, auto-preview start set at the end.
-3. `resave_game.py`: update for v2 (keep the no-Text-write rule, see below).
-4. `verify_game.py`: rewrite for v2 (story clean, sidecar present, bindings
-   vs scene, preview works, build-twice key survival, bricks, v1.9.0).
-5. Full chain + stills (preview main, addon-render typing proof, menu proof),
-   keep `test_persistence/test_load_repair/test_ops` passing, rewrite README
-   (v2 workflow + schema reference), push.
+### Gotchas added since the v1 list
+- **Never `bpy.ops.wm.open_mainfile()` inside a UI session** on UPBGE 0.50:
+  it segfaults at teardown (probed: open + quit with nothing else in between
+  exits 139) and `bpy.ops.object.game_property_new` after it hangs. Loading
+  the same file as a command-line ARGUMENT is clean — hence build_scene's
+  re-exec with `bpy.app.binary_path` (NOT `sys.executable`: in UPBGE that is
+  the bundled python3.11, which tried to run the .blend as a script).
+- `Matrix.identity()` mutates in place and returns None — never assign its
+  result. `_pose_menu` / parenting use `.identity()` as a statement.
+- Comparing an animated value against a rest pose is a bad evaluation proof
+  (an idle bob can be exactly sin(36*pi)==0 at its last frame): compare the
+  evaluated depsgraph value against what the ACTION keys say at that frame.
 
 ## Locked design decisions (do not relitigate without the user)
 
