@@ -49,35 +49,3 @@ pick a robot!
 00:00:15,000 --> 00:00:17,000
 [CAM Wide]
 Who gets the last word?
-
-10
-00:00:17,000 --> 00:00:18,875
-[CAM Cuby]
-CUBY: Cubes rule!
-Six sides of awesome.
-
-11
-00:00:18,875 --> 00:00:20,750
-CUBY: Count my corners:
-eight! All mine!
-
-12
-00:00:20,750 --> 00:00:22,500
-CUBY: Stay square,
-friend!
-
-13
-00:00:23,000 --> 00:00:24,875
-[CAM Sphero]
-SPHERO: Spheres supreme!
-Zero corners, zero fear!
-
-14
-00:00:24,875 --> 00:00:26,750
-SPHERO: I roll everywhere.
-Beats walking!
-
-15
-00:00:26,750 --> 00:00:28,500
-SPHERO: Stay round!
-See you!

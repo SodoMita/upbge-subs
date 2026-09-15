@@ -1,0 +1,15 @@
+1
+00:00:00,000 --> 00:00:01,875
+[CAM Sphero]
+SPHERO: Spheres supreme!
+Zero corners, zero fear!
+
+2
+00:00:01,875 --> 00:00:03,750
+SPHERO: I roll everywhere.
+Beats walking!
+
+3
+00:00:03,750 --> 00:00:05,500
+SPHERO: Stay round!
+See you!

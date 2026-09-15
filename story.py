@@ -1,62 +1,59 @@
-"""Story wiring for Talking Robots: sets, actors, choices, ends (YAML).
+"""Story wiring v2 for Talking Robots: animation-centric sets (YAML).
 
-Plain SRT stays valid for external editors (Subtitle Edit, Aegisub, ...):
-subtitle text + [CAM] shot plan live in dialogue.srt, everything else lives
-in story.yml. This module (stdlib only, no bpy) parses both into the
-structure consumed by build_scene.py (starter camera keys, menu preview,
-markers, frame range), resave_game.py (validation) and verify_game.py.
-The game driver (game_subtitles.py) carries verbatim copies of the two
-parsers + the checker - it cannot import sibling files in the engine.
+Subtitle text + [CAM] shot plans live in .srt files (one per set, edited
+with any subtitle software); everything else lives in story.yml. This
+module (stdlib only, no bpy) parses both into per-set runtime plans
+consumed by the game driver (game_subtitles.py, loaded from disk next to
+the .blend), the Blender add-on (preview/validation/sync) and the tools.
 
-story.yml scheme (short on purpose):
+A set = a bundle of animations played together from t=0. Subtitles are
+one animation type among others; blocking animations gate the set's end:
+
+story.yml scheme:
   start: <set>            the set played at start
   cps: <number>           typewriter speed (chars per second)
-  subs: <path>            subtitle file (relative to story.yml, // = blend)
-  actors: [<object>...]   objects whose own actions the game plays
   sets:
     <name>:
-      cues: [first, last] SRT cue numbers (inclusive)
-      frames: [f0, f1]    timeline range the actors play in-game
-      lens: <mm>          camera lens while this set plays
+      anims:
+        - subs: file.srt#a-b    typewriter over cues a..b of that file
+        - camera: ShotName       opening staged camera (optional)
+        - action: Obj@Act        play action Act on object Obj
+        - audio: file.ogg        fire-and-forget sound
+        - {action: Obj@Act, at: 2.0, wait: false}   offset + ambience
       end: stop | goto <set> | choice <id>
   choices:
     <id>:
-      prompt_cue: <n>     SRT cue whose text is the prompt
+      prompt: file.srt#N    cue whose text is the prompt
       options:
         - [key, label, set]   (key 1-9)
 
-  Only this YAML subset is supported: # comments, key: value maps, - list
-  items, [flow, lists] (lists only - maps use block style), single/double
-  quoted strings ("\\n" etc. inside double quotes). Anything else is a
-  plain string. Indent with spaces, never tabs.
+Rules: cue numbers are per-file; SRT times are set-local (author each
+file from 00:00); `at:` shifts an anim in seconds; subs/action block the
+end unless `wait: false`; camera/audio never block; [CAM X] cues switch
+shots mid-set; references are Blender object names (the add-on watches
+renames and syncs them back). Files resolve next to story.yml: subtitles
+in `.` and `./subtitles/`, audio in `./audio/` and `.`.
 
-[CAM <shot>] lines inside SRT cues steer the starter camera bake only
-(shots: Wide, Cuby, Sphero). The pre-1.8 wiring directives ([BRANCH],
-[CHOICE], [OPT], [GOTO], [END]) are legacy: still stripped from visible
-text, but ignored with a warning - wiring lives in story.yml now.
+Only this YAML subset is supported: # comments, key: value maps,
+- list items, [flow, lists], {flow: maps} (single-line; use them for
+anim options), single/double quoted strings. Anything else is a plain
+string. Indent with spaces, never tabs.
 
 Speaker convention: text starting with "CUBY:", "SPHERO:" or "BOTH:"
 (case-insensitive) is acted out by those robots; anything else is narration.
 """
 
+import json
 import os
 import re
 
 DIRECTIVES = ("CAM",)
 LEGACY_DIRECTIVES = ("BRANCH", "CHOICE", "OPT", "GOTO", "END")
-SHOTS = ("Wide", "Cuby", "Sphero")
-
-# Staged shot cameras: ((loc_x, loc_y, loc_z), (target_x, target_y, target_z)).
-# Editor framing rig (tweak the objects in the viewport); the starter camera
-# keys are baked from them, then the keys are yours to edit. Wide drifts
-# A -> B (the slow push-in) inside Wide spans.
-WIDE_A = ((0.0, -7.3, 3.35), (0.0, 0.0, 1.05))
-WIDE_B = ((0.0, -6.7, 3.05), (0.0, 0.0, 1.05))
-CUBY_SHOT = ((-1.25, -4.6, 2.0), (-1.25, 0.0, 1.05))
-SPHERO_SHOT = ((1.25, -4.6, 2.1), (1.25, 0.0, 1.05))
-SHOT_POSES = {"Wide": WIDE_A, "WideEnd": WIDE_B,
-              "Cuby": CUBY_SHOT, "Sphero": SPHERO_SHOT}
-SHOT_LENS = {"Wide": 50, "WideEnd": 50, "Cuby": 55, "Sphero": 45}
+ANIM_TYPES = ("subs", "action", "camera", "audio")
+BLOCKING_DEFAULT = {"subs": True, "action": True,
+                    "camera": False, "audio": False}
+SUBS_DIRS = (".", "subtitles")
+AUDIO_DIRS = ("audio", ".")
 
 
 def is_directive(line):
@@ -118,7 +115,7 @@ def parse_srt_simple(text):
 
     The cue number is the SRT number row (block position if missing);
     directive lines are stripped from the text. Blocks without a timing
-    row are skipped. NOTE: game_subtitles.py embeds a verbatim copy.
+    row are skipped.
     """
     cues = {}
     for pos, rows in enumerate(_split_blocks(text), 1):
@@ -147,8 +144,9 @@ def parse_srt_simple(text):
 def parse_script(text):
     """Full subtitle parse -> {"errors", "warnings", "cues", "cams"}.
 
-    cues = parse_srt_simple(); cams = [[absolute_time, shot]] from [CAM].
-    Legacy wiring directives are ignored with a warning each.
+    cues = parse_srt_simple(); cams = [[time, shot, cue_no]] from [CAM].
+    Shot names are NOT validated here (the scene owns them; see
+    check_bindings). Legacy wiring directives are ignored with a warning.
     """
     errors, warnings = [], []
     cues = parse_srt_simple(text)
@@ -189,11 +187,8 @@ def parse_script(text):
             elif tok == "CAM":
                 if not arg:
                     errors.append("[CAM] needs a shot name (cue %d)" % number)
-                elif arg not in SHOTS:
-                    errors.append("[CAM %s]: unknown shot, want %s"
-                                  % (arg, "/".join(SHOTS)))
                 else:
-                    cams.append([t0, arg])
+                    cams.append([t0, arg, number])
     if not cues:
         errors.append("no usable cues (need number/timing/text blocks)")
     cams.sort(key=lambda c: c[0])
@@ -203,26 +198,32 @@ def parse_script(text):
 
 # --------------------------------------------------------------------------
 # minimal YAML subset (see the scheme in the module docstring)
-# NOTE: game_subtitles.py embeds a verbatim copy of everything down to
-# parse_minimal_yaml; test_story.py checks both copies agree.
 # --------------------------------------------------------------------------
 
 def _strip_comment(line):
     q = None
     esc = False
-    for i, ch in enumerate(line):
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
         if q is not None:
             if esc:
                 esc = False
             elif ch == "\\":
                 esc = True
             elif ch == q:
+                if q == "'" and i + 1 < n and line[i + 1] == "'":
+                    i += 2  # doubled quote: literal, stays open
+                    continue
                 q = None
         else:
-            if ch in ("'", '"') and (i == 0 or line[i - 1] in " \t:[,"):
+            if ch in ("'", '"') and (i == 0 or line[i - 1] in " \t:[,{"):
                 q = ch
-            elif ch == "#":
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                # real YAML rule: '#' comments only after whitespace, so
+                # cue refs like file.srt#1-8 survive unquoted
                 return line[:i]
+        i += 1
     return line
 
 
@@ -265,12 +266,10 @@ def _flow_tokenize(s):
         if ch in " \t":
             i += 1
             continue
-        if ch in "[],":
+        if ch in "[],{}:":
             toks.append(ch)
             i += 1
             continue
-        if ch in "{}":
-            raise ValueError("flow {...} is not supported (use block style)")
         if ch in ("'", '"'):
             q = ch
             j = i + 1
@@ -301,14 +300,11 @@ def _flow_tokenize(s):
             i = j + 1
             continue
         j = i
-        while j < n and s[j] not in ",[]":
-            if s[j] in "{}":
-                raise ValueError("flow {...} is not supported "
-                                 "(use block style)")
+        while j < n and s[j] not in ",[]{}:":
             j += 1
         atom = s[i:j].strip()
         if not atom:
-            raise ValueError("empty value in flow list")
+            raise ValueError("empty value in flow collection")
         toks.append(("atom", atom))
         i = j
     return toks
@@ -326,6 +322,11 @@ def _parse_flow(s):
         pos[0] += 1
         return t
 
+    def scalar(t):
+        if isinstance(t, tuple):
+            return t[1] if t[0] == "str" else _parse_scalar(t[1])
+        raise ValueError("unexpected %r in flow collection" % (t,))
+
     def value():
         t = nxt()
         if t == "[":
@@ -341,15 +342,33 @@ def _parse_flow(s):
                 if t2 != ",":
                     raise ValueError("want ',' or ']' in flow list")
             return out
-        if isinstance(t, tuple):
-            return t[1] if t[0] == "str" else _parse_scalar(t[1])
-        raise ValueError("unexpected %r in flow list" % (t,))
+        if t == "{":
+            out = {}
+            if peek() == "}":
+                nxt()
+                return out
+            while True:
+                k = scalar(nxt())
+                if not isinstance(k, str) or not k:
+                    raise ValueError("flow map keys must be names")
+                if k in out:
+                    raise ValueError("duplicate key %r in flow map" % k)
+                if nxt() != ":":
+                    raise ValueError("want 'key: value' in flow map")
+                out[k] = value()
+                t2 = nxt()
+                if t2 == "}":
+                    return out
+                if t2 != ",":
+                    raise ValueError("want ',' or '}' in flow map")
+            return out
+        return scalar(t)
 
     v = value()
     if peek() is not None:
-        raise ValueError("trailing %r after flow list" % (peek(),))
-    if not isinstance(v, list):
-        raise ValueError("flow value must be a [...] list")
+        raise ValueError("trailing %r after flow collection" % (peek(),))
+    if not isinstance(v, (list, dict)):
+        raise ValueError("flow value must be [...] or {...}")
     return v
 
 
@@ -381,14 +400,11 @@ def parse_minimal_yaml(text):
         return None
 
     def flow_or_scalar(val, no):
-        if val.startswith("["):
+        if val.startswith(("[", "{")):
             try:
                 return _parse_flow(val)
             except ValueError as ex:
                 raise ValueError("line %d: %s" % (no, ex))
-        if val.startswith("{"):
-            raise ValueError("line %d: flow {...} is not supported "
-                             "(use block style)" % no)
         return _parse_scalar(val)
 
     def parse_block(indent):
@@ -435,6 +451,12 @@ def parse_minimal_yaml(text):
             if item == "":
                 out.append(nested(indent, no))
             else:
+                if (pos[0] < len(raw) and raw[pos[0]][0] > indent
+                        and ":" in item
+                        and not item.startswith(("[", "{"))):
+                    raise ValueError(
+                        "line %d: multi-line list items need flow style, "
+                        "e.g. - {subs: f.srt#1-2, at: 3.0}" % no)
                 out.append(flow_or_scalar(item, no))
         if pos[0] < len(raw) and raw[pos[0]][0] > indent:
             bad = raw[pos[0]]
@@ -445,19 +467,110 @@ def parse_minimal_yaml(text):
 
 
 # --------------------------------------------------------------------------
-# story checking
+# animation references
 # --------------------------------------------------------------------------
+
+def parse_subs_ref(value):
+    """'file.srt#a-b' / 'file.srt#N' -> (file, a, b, error)."""
+    if not isinstance(value, str):
+        return None, 0, 0, "subs reference must be 'file.srt#a-b'"
+    if value.count("#") != 1:
+        return None, 0, 0, "subs reference %r needs one '#'" % (value,)
+    fname, _, span = value.partition("#")
+    fname = fname.strip()
+    if not fname:
+        return None, 0, 0, "subs reference %r needs a file" % (value,)
+    bits = span.split("-")
+    if len(bits) == 1:
+        bits = bits * 2
+    if len(bits) != 2 or not all(b.strip().isdigit() for b in bits):
+        return None, 0, 0, "subs reference %r needs cue numbers" % (value,)
+    a, b = int(bits[0]), int(bits[1])
+    if a < 1 or b < a:
+        return None, 0, 0, "subs cue range %r must rise from 1+" % (value,)
+    return fname, a, b, ""
+
+
+def parse_cue_ref(value):
+    """'file.srt#N' -> (file, n, error)."""
+    fname, a, b, err = parse_subs_ref(value)
+    if err:
+        return None, 0, err
+    if a != b:
+        return None, 0, "cue reference %r must be a single cue" % (value,)
+    return fname, a, ""
+
+
+def parse_action_ref(value):
+    """'Object@Action' -> (object, action, error)."""
+    if not isinstance(value, str):
+        return None, None, "action reference must be 'Object@Action'"
+    bits = value.split("@")
+    if len(bits) != 2 or not bits[0].strip() or not bits[1].strip():
+        return None, None, "action reference %r must be 'Object@Action'" % (
+            value,)
+    return bits[0].strip(), bits[1].strip(), ""
+
+
+def normalize_anim(entry):
+    """Anim entry -> ({"type", "value", "at", "wait"}, error).
+
+    Accepts the 'type: value' shorthand string and the {type: value,
+    at:, wait:} flow map. wait defaults per type (subs/action block).
+    """
+    at, wait, at_set, wait_set = 0.0, None, False, False
+    if isinstance(entry, dict):
+        types = [k for k in entry if k in ANIM_TYPES]
+        if len(types) != 1:
+            return None, "anim %r needs exactly one of %s" % (
+                entry, "/".join(ANIM_TYPES))
+        atype = types[0]
+        value = entry[atype]
+        for k in entry:
+            if k not in ANIM_TYPES + ("at", "wait"):
+                return None, "anim %r: unknown key '%s'" % (entry, k)
+        if "at" in entry:
+            at, at_set = entry["at"], True
+        if "wait" in entry:
+            wait, wait_set = entry["wait"], True
+    elif isinstance(entry, str) and ":" in entry:
+        atype, _, value = entry.partition(":")
+        atype, value = atype.strip(), value.strip()
+        if atype not in ANIM_TYPES:
+            return None, "anim %r: unknown type '%s'" % (entry, atype)
+        if not value:
+            return None, "anim %r needs a value" % (entry,)
+    else:
+        return None, "anim %r must be 'type: value' or {type: value, ...}" % (
+            entry,)
+    if at_set and (type(at) is bool or not isinstance(at, (int, float))
+                   or not at >= 0):
+        return None, "anim '%s: %s': 'at' must be seconds >= 0" % (
+            atype, value)
+    if wait_set and type(wait) is not bool:
+        return None, "anim '%s: %s': 'wait' must be true/false" % (
+            atype, value)
+    if wait is None:
+        wait = BLOCKING_DEFAULT[atype]
+    return {"type": atype, "value": value, "at": float(at), "wait": wait}, ""
+
 
 def _is_num(x):
     return type(x) in (int, float)
 
 
-def check_story(story, cues):
-    """Crash-path validation of a parsed story -> [error strings].
+def _end_bits(end):
+    if end is None:
+        return []
+    return str(end).strip().split(None, 1)
 
-    Every path the game driver walks (start set, ends, options, cue
-    ranges) is covered: a story with no errors here cannot KeyError the
-    driver. NOTE: game_subtitles.py embeds a verbatim copy.
+
+def check_story(story, files):
+    """Crash-path validation -> [error strings].
+
+    files = {name: {"cues": {n: {"start", "end", "text"}}}} as loaded.
+    Every path the game driver walks is covered: no errors here means the
+    driver cannot KeyError on story data.
     """
     if not isinstance(story, dict):
         return ["story must be a mapping of key: value lines"]
@@ -476,34 +589,59 @@ def check_story(story, cues):
     if not isinstance(choices, dict):
         errs.append("'choices' must be a mapping")
         choices = {}
+    anims_of = {}
     for name, s in sets.items():
         tag = "set '%s'" % (name,)
         if not isinstance(s, dict):
             errs.append("%s must be a mapping" % tag)
+            anims_of[name] = []
             continue
-        cr = s.get("cues")
-        if (not isinstance(cr, list) or len(cr) != 2
-                or not all(type(v) is int for v in cr)):
-            errs.append("%s: 'cues' must be [first, last] cue numbers" % tag)
-        elif cr[0] > cr[1]:
-            errs.append("%s: cue range must rise, got %s" % (tag, cr))
+        anims = s.get("anims")
+        if not isinstance(anims, list) or not anims:
+            errs.append("%s needs a non-empty 'anims' list" % tag)
+            anims_of[name] = []
         else:
-            for v in cr:
-                if v not in cues:
-                    errs.append("%s: cue %d is not in dialogue.srt"
-                                % (tag, v))
-        fr = s.get("frames")
-        if (not isinstance(fr, list) or len(fr) != 2
-                or not all(type(v) is int for v in fr)):
-            errs.append("%s: 'frames' must be [first, last] frames" % tag)
-        elif fr[0] < 1 or fr[1] < fr[0]:
-            errs.append("%s: frames must start at 1+ and rise, got %s"
-                        % (tag, fr))
-        lens = s.get("lens")
-        if not _is_num(lens) or not lens > 0:
-            errs.append("%s: 'lens' must be a number above zero" % tag)
-        end = s.get("end")
-        bits = str(end).strip().split(None, 1) if end is not None else []
+            ok = []
+            cams = 0
+            for i, e in enumerate(anims):
+                atag = "%s anim %d" % (tag, i + 1)
+                anim, err = normalize_anim(e)
+                if err:
+                    errs.append("%s: %s" % (atag, err))
+                    continue
+                ok.append(anim)
+                if anim["type"] == "subs":
+                    f, a, b, referr = parse_subs_ref(anim["value"])
+                    if referr:
+                        errs.append("%s: %s" % (atag, referr))
+                    elif f not in files:
+                        errs.append("%s: subtitle file '%s' not found "
+                                    "(looked in . and ./subtitles)" % (atag, f))
+                    else:
+                        cues = files[f]["cues"]
+                        for v in range(a, b + 1):
+                            if v not in cues:
+                                errs.append("%s: cue %d is not in %s"
+                                            % (atag, v, f))
+                elif anim["type"] == "action":
+                    _o, _a, referr = parse_action_ref(anim["value"])
+                    if referr:
+                        errs.append("%s: %s" % (atag, referr))
+                elif anim["type"] == "camera":
+                    cams += 1
+                    if not isinstance(anim["value"], str) \
+                            or not anim["value"].strip():
+                        errs.append("%s: camera needs a shot object name"
+                                    % atag)
+                elif anim["type"] == "audio":
+                    if not isinstance(anim["value"], str) \
+                            or not anim["value"].strip():
+                        errs.append("%s: audio needs a file name" % atag)
+            if cams > 1:
+                errs.append("%s: only one 'camera' anim per set "
+                            "(shots switch via [CAM])" % tag)
+            anims_of[name] = ok
+        bits = _end_bits(s.get("end"))
         if bits == ["stop"]:
             pass
         elif len(bits) == 2 and bits[0] == "goto":
@@ -520,10 +658,14 @@ def check_story(story, cues):
         if not isinstance(ch, dict):
             errs.append("%s must be a mapping" % tag)
             continue
-        pc = ch.get("prompt_cue")
-        if type(pc) is not int or pc not in cues:
-            errs.append("%s: 'prompt_cue' must be a cue number in "
-                        "dialogue.srt" % tag)
+        f, n, referr = parse_cue_ref(ch.get("prompt"))
+        if referr:
+            errs.append("%s: bad 'prompt': %s" % (tag, referr))
+        elif f not in files:
+            errs.append("%s: subtitle file '%s' not found "
+                        "(looked in . and ./subtitles)" % (tag, f))
+        elif n not in files[f]["cues"]:
+            errs.append("%s: cue %d is not in %s" % (tag, n, f))
         opts = ch.get("options")
         if not isinstance(opts, list) or not opts:
             errs.append("%s needs a non-empty 'options' list" % tag)
@@ -542,62 +684,201 @@ def check_story(story, cues):
                 errs.append("%s: label must be non-empty text" % otag)
             if dest not in sets:
                 errs.append("%s targets unknown set '%s'" % (otag, dest))
-    subs = story.get("subs")
-    if not isinstance(subs, str) or not subs.strip():
-        errs.append("'subs' must be the subtitle file path (a string)")
-    actors = story.get("actors")
-    if not isinstance(actors, list) or not actors:
-        errs.append("'actors' must be a non-empty list of object names")
-    else:
-        for i, a in enumerate(actors):
-            if not isinstance(a, str) or not a.strip():
-                errs.append("actor %d must be an object name" % (i + 1))
     cps = story.get("cps")
     if not _is_num(cps) or not cps > 0:
         errs.append("'cps' must be a number above zero")
+    if not errs:
+        errs.extend(_loop_checks(story, anims_of))
     return errs
 
 
-def range_checks(story, cues, f0, f_end):
-    """Timeline-fit validation (tool side; the game never needs it)."""
+def _blocking_set(anims):
+    return any(a["wait"] and a["type"] in ("subs", "action") for a in anims)
+
+
+def _loop_checks(story, anims_of):
+    """Instant-loop detection: a goto cycle with no blocking set and no
+    choice/stop inside would hang the game on one tick."""
     errs = []
+    sets = story.get("sets", {})
+    for name in sets:
+        seen = []
+        cur = name
+        while True:
+            if cur in seen:
+                cyc = seen[seen.index(cur):]
+                if not any(_blocking_set(anims_of.get(c, [])) for c in cyc):
+                    errs.append("sets %s loop with no blocking animation "
+                                "(game would hang)" % " -> ".join(cyc))
+                break
+            seen.append(cur)
+            s = sets.get(cur)
+            if not isinstance(s, dict):
+                break
+            bits = _end_bits(s.get("end"))
+            if len(bits) == 2 and bits[0] == "goto" and bits[1] in sets:
+                cur = bits[1]
+                continue
+            break
+    return sorted(set(errs))
+
+
+def warn_story(story, files):
+    """Non-fatal smells -> [warning strings] (tools show these)."""
+    warns = []
+    if not isinstance(story, dict):
+        return warns
+    sets = story.get("sets", {})
+    choices = story.get("choices", {}) or {}
+    for name, s in sets.items():
+        if not isinstance(s, dict):
+            continue
+        for e in s.get("anims", []):
+            anim, err = normalize_anim(e) if isinstance(
+                e, (str, dict)) else (None, "x")
+            if err or anim is None:
+                continue
+            if anim["type"] in ("camera", "audio") and anim["wait"]:
+                warns.append("set '%s': '%s' never blocks; 'wait: true' "
+                             "is ignored" % (name, anim["type"]))
+            if anim["type"] == "subs":
+                f, a, _b, referr = parse_subs_ref(anim["value"])
+                if referr or f not in files:
+                    continue
+                cues = files[f]["cues"]
+                if a in cues and cues[a]["start"] + anim["at"] > 1.0:
+                    warns.append("set '%s': subs start %.1fs in "
+                                 "(leading silence)" % (
+                                     name, cues[a]["start"] + anim["at"]))
+    # prompt echoed inside its own offering set's subs range
+    for name, s in sets.items():
+        if not isinstance(s, dict):
+            continue
+        bits = _end_bits(s.get("end"))
+        if len(bits) != 2 or bits[0] != "choice":
+            continue
+        ch = choices.get(bits[1])
+        if not isinstance(ch, dict):
+            continue
+        f, n, referr = parse_cue_ref(ch.get("prompt"))
+        if referr or f not in files:
+            continue
+        for e in s.get("anims", []):
+            anim, err = normalize_anim(e) if isinstance(
+                e, (str, dict)) else (None, "x")
+            if err or anim is None or anim["type"] != "subs":
+                continue
+            sf, sa, sb, serr = parse_subs_ref(anim["value"])
+            if not serr and sf == f and sa <= n <= sb:
+                warns.append("choice '%s' prompt %s#%d is inside set '%s' "
+                             "subs (shows twice)" % (bits[1], f, n, name))
+    # reachability from start
+    if isinstance(sets, dict) and story.get("start") in sets:
+        seen_sets, seen_choices = set(), set()
+
+        def visit(sname):
+            if sname in seen_sets:
+                return
+            seen_sets.add(sname)
+            s = sets.get(sname)
+            if not isinstance(s, dict):
+                return
+            bits = _end_bits(s.get("end"))
+            if len(bits) == 2 and bits[0] == "goto":
+                visit(bits[1])
+            elif len(bits) == 2 and bits[0] == "choice":
+                seen_choices.add(bits[1])
+                ch = choices.get(bits[1])
+                if isinstance(ch, dict):
+                    for o in ch.get("options", []):
+                        if isinstance(o, list) and len(o) == 3:
+                            visit(o[2])
+
+        visit(story["start"])
+        for sname in sets:
+            if sname not in seen_sets:
+                warns.append("set '%s' is unreachable from 'start'" % sname)
+        for cid in choices:
+            if cid not in seen_choices:
+                warns.append("choice '%s' is never offered" % cid)
+    return warns
+
+
+def check_bindings(story, objects, actions, cameras):
+    """Scene-name validation -> [error strings].
+
+    objects/actions/cameras are name collections from the live scene (or
+    the sync sidecar for actions). Call after check_story passes.
+    """
+    errs = []
+    objects, actions, cameras = set(objects), set(actions), set(cameras)
     for name, s in story.get("sets", {}).items():
-        fr = s.get("frames")
-        if (isinstance(fr, list) and len(fr) == 2
-                and all(type(v) is int for v in fr)):
-            if fr[0] < f0 or fr[1] > f_end:
-                errs.append("set '%s': frames %s exceed the timeline %d-%d"
-                            % (name, fr, f0, f_end))
-        bits = str(s.get("end")).strip().split(None, 1)
-        if len(bits) == 2 and bits[0] == "choice":
-            ch = story.get("choices", {}).get(bits[1])
-            if isinstance(ch, dict) and type(ch.get("prompt_cue")) is int:
-                cr = s.get("cues")
-                if (isinstance(cr, list) and len(cr) == 2
-                        and all(type(v) is int for v in cr)):
-                    if not cr[0] <= ch["prompt_cue"] <= cr[1]:
-                        errs.append("choice '%s' prompt cue %d is outside "
-                                    "set '%s' cues %s"
-                                    % (bits[1], ch["prompt_cue"], name, cr))
+        if not isinstance(s, dict):
+            continue
+        for i, e in enumerate(s.get("anims", [])):
+            atag = "set '%s' anim %d" % (name, i + 1)
+            anim, err = normalize_anim(e) if isinstance(
+                e, (str, dict)) else (None, "x")
+            if err or anim is None:
+                continue
+            if anim["type"] == "action":
+                o, a, _ = parse_action_ref(anim["value"])
+                if o not in objects:
+                    errs.append("%s: object '%s' is not in the scene"
+                                % (atag, o))
+                if a not in actions:
+                    errs.append("%s: action '%s' does not exist" % (atag, a))
+            elif anim["type"] == "camera":
+                if anim["value"] not in cameras:
+                    errs.append("%s: shot '%s' is not a camera in the scene"
+                                % (atag, anim["value"]))
     return errs
 
 
-def validate_story(story, cues, f0, f_end):
-    """check_story + range_checks (build/resave/verify entry point)."""
-    errs = check_story(story, cues)
-    if errs:
-        return errs
-    return range_checks(story, cues, f0, f_end)
+def _resolve_here(base_dir, name, dirs):
+    for d in dirs:
+        cand = os.path.normpath(os.path.join(base_dir, d, name))
+        if os.path.isfile(cand):
+            return cand
+    return ""
 
 
-def load_story_files(story_path, f0=None, f_end=None):
-    """Read story.yml + its subtitle file -> one dict.
+def _gather_refs(story):
+    """(subs_files, prompt_files, audio_files) referenced by the story."""
+    subs, audio = set(), set()
+    if not isinstance(story, dict):
+        return subs, audio
+    for s in story.get("sets", {}).values():
+        if not isinstance(s, dict):
+            continue
+        for e in s.get("anims", []):
+            anim, err = normalize_anim(e) if isinstance(
+                e, (str, dict)) else (None, "x")
+            if err or anim is None:
+                continue
+            if anim["type"] == "subs":
+                f, _a, _b, referr = parse_subs_ref(anim["value"])
+                if not referr:
+                    subs.add(f)
+            elif anim["type"] == "audio" and isinstance(anim["value"], str):
+                audio.add(anim["value"].strip())
+    for ch in (story.get("choices", {}) or {}).values():
+        if not isinstance(ch, dict):
+            continue
+        f, _n, referr = parse_cue_ref(ch.get("prompt"))
+        if not referr:
+            subs.add(f)
+    return subs, audio
 
-    {"errors", "warnings", "story", "cues", "cams", "srt_path"}.
-    Pass the scene range (f0, f_end) for timeline-fit validation too.
+
+def load_story_files(story_path):
+    """Read story.yml + every referenced .srt/.ogg path check -> one dict.
+
+    {"errors", "warnings", "story", "dir", "files": {name: {"path",
+    "cues", "cams"}}, "audio": {name: path}}. Missing files are errors.
     """
-    blank = {"errors": [], "warnings": [], "story": {}, "cues": {},
-             "cams": [], "srt_path": ""}
+    blank = {"errors": [], "warnings": [], "story": {}, "dir": "",
+             "files": {}, "audio": {}}
     try:
         with open(story_path, encoding="utf-8-sig") as fh:
             story = parse_minimal_yaml(fh.read())
@@ -608,35 +889,41 @@ def load_story_files(story_path, f0=None, f_end=None):
         blank["errors"] = ["%s: %s" % (story_path, ex)]
         return blank
     blank["story"] = story
-    subs_name = story.get("subs", "dialogue.srt") \
-        if isinstance(story, dict) else "dialogue.srt"
-    if not isinstance(subs_name, str) or not subs_name.strip():
-        subs_name = "dialogue.srt"
-    if os.path.isabs(subs_name):
-        srt_path = subs_name
-    else:
-        srt_path = os.path.join(os.path.dirname(os.path.abspath(story_path)),
-                                subs_name)
-    blank["srt_path"] = srt_path
-    try:
-        with open(srt_path, encoding="utf-8-sig") as fh:
-            script = parse_script(fh.read())
-    except OSError as ex:
-        blank["errors"] = ["cannot read %s (%s)" % (srt_path, ex)]
-        return blank
-    blank["warnings"] = list(script["warnings"])
-    blank["cues"] = script["cues"]
-    blank["cams"] = script["cams"]
-    blank["errors"] = list(script["errors"])
-    blank["errors"].extend(check_story(story, script["cues"]))
-    if f0 is not None and f_end is not None and not blank["errors"]:
-        blank["errors"].extend(range_checks(story, script["cues"], f0, f_end))
+    base = os.path.dirname(os.path.abspath(story_path))
+    blank["dir"] = base
+    subs_refs, audio_refs = _gather_refs(story)
+    for name in sorted(subs_refs):
+        path = _resolve_here(base, name, SUBS_DIRS)
+        if not path:
+            blank["errors"].append(
+                "subtitle file '%s' not found (. and ./subtitles)" % name)
+            continue
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                script = parse_script(fh.read())
+        except OSError as ex:
+            blank["errors"].append("cannot read %s (%s)" % (path, ex))
+            continue
+        blank["files"][name] = {"path": path, "cues": script["cues"],
+                                "cams": script["cams"]}
+        blank["warnings"].extend("%s: %s" % (name, w)
+                                 for w in script["warnings"])
+        blank["errors"].extend("%s: %s" % (name, e)
+                               for e in script["errors"])
+    for name in sorted(audio_refs):
+        if not name:
+            continue
+        path = _resolve_here(base, name, AUDIO_DIRS)
+        if not path:
+            blank["errors"].append(
+                "audio file '%s' not found (./audio and .)" % name)
+        else:
+            blank["audio"][name] = path
+    blank["errors"].extend(check_story(story, blank["files"]))
+    if not blank["errors"]:
+        blank["warnings"].extend(warn_story(story, blank["files"]))
     return blank
 
-
-# --------------------------------------------------------------------------
-# timeline helpers (starter bake + markers + menu preview)
-# --------------------------------------------------------------------------
 
 def ordered_cues(cues):
     """[(number, start, end, text, speakers)] sorted by number."""
@@ -644,55 +931,214 @@ def ordered_cues(cues):
              speakers_of(cues[n]["text"])) for n in sorted(cues)]
 
 
-def cam_spans(cams, fps, f0, f_end):
-    """[(frame0, frame1, shot)] with inclusive frames, covering f0..f_end.
-
-    Consecutive same-shot ranges are merged. With no [CAM] at all the
-    whole timeline is one Wide span (so the push-in still applies).
-    """
-    pts = []
-    for (ct, shot) in cams:
-        f = f0 + round(ct * fps)
-        pts.append((min(max(f, f0), f_end), shot))
-    if not pts:
-        return [(f0, f_end, "Wide")]
-    pts.sort(key=lambda p: p[0])  # stable: file order wins ties
-    merged = []
-    for (f, s) in pts:
-        if merged and merged[-1][0] == f:
-            merged[-1] = (f, s)  # same frame: last one wins
-        else:
-            merged.append((f, s))
-    spans = []
-    cur_f, cur_s = f0, merged[0][1]
-    for (f, s) in merged:
-        if f > cur_f:
-            spans.append((cur_f, f - 1, cur_s))
-            cur_f, cur_s = f, s
-        else:
-            cur_s = s
-    spans.append((cur_f, f_end, cur_s))
-    out = []
-    for (a, z, s) in spans:
-        if out and out[-1][2] == s and out[-1][1] + 1 == a:
-            out[-1] = (out[-1][0], z, s)
-        else:
-            out.append((a, z, s))
-    return out
-
-
 def menu_body(options):
-    """Static timeline text for the choice menu (cursor on option 1)."""
+    """Static menu text (cursor on option 1)."""
     return "\n".join("%s %s: %s" % (">" if i == 0 else " ", o[0], o[1])
                      for i, o in enumerate(options))
 
 
-def marker_frames(story, cues, fps, f0):
-    """{"SET-<set>": frame, "CH-<choice>": prompt frame} for markers."""
-    marks = {}
-    for name, s in story.get("sets", {}).items():
-        marks["SET-" + str(name)] = s["frames"][0]
-    for cid, ch in story.get("choices", {}).items():
-        t = cues[ch["prompt_cue"]]["start"]
-        marks["CH-" + str(cid)] = f0 + round(t * fps)
-    return marks
+# --------------------------------------------------------------------------
+# runtime plans (game + preview share these)
+# --------------------------------------------------------------------------
+
+def set_plan(story, files, set_name, action_ranges=None, fps=24.0):
+    """Per-set runtime plan with set-local seconds.
+
+    {"subs": [(start, end, text)], "dur": subs-blocking end (0 if none),
+     "actions": [(obj, act, at, wait, dur_or_None)],
+     "shots": [(t, shot_obj)] (opening first; [] = hold framing),
+     "audios": [(file, at)], "end": ("stop"|"goto"|"choice", target),
+     "prompt": text}. action_ranges = {act: [f0, f1]} from the sync sidecar
+    (or the live scene); durations divide by fps.
+    """
+    s = story["sets"][set_name]
+    subs, shots, actions, audios = [], [], [], []
+    opening = None
+    for e in s.get("anims", []):
+        anim, err = normalize_anim(e)
+        if err:
+            continue
+        at = anim["at"]
+        if anim["type"] == "subs":
+            f, a, b, _ = parse_subs_ref(anim["value"])
+            cues = files[f]["cues"]
+            for n in range(a, b + 1):
+                c = cues[n]
+                rounding = (round(c["start"] + at, 4), round(c["end"] + at, 4),
+                            c["text"], anim["wait"])
+                subs.append(rounding)
+            for (ct, shot, cn) in files[f]["cams"]:
+                if a <= cn <= b:
+                    shots.append((round(ct + at, 4), shot))
+        elif anim["type"] == "camera":
+            opening = anim["value"]
+        elif anim["type"] == "action":
+            o, a, _ = parse_action_ref(anim["value"])
+            dur = None
+            if action_ranges and a in action_ranges:
+                f0, f1 = action_ranges[a]
+                dur = max(0.0, (f1 - f0) / fps)
+            actions.append((o, a, at, anim["wait"], dur))
+        elif anim["type"] == "audio":
+            audios.append((anim["value"], at))
+    subs.sort(key=lambda c: c[0])
+    shots.sort(key=lambda c: c[0])
+    if opening is not None:
+        # opening first: a t=0 [CAM] cue wins ties (runtime takes the last
+        # shot at or before now), an identical one is harmless
+        shots = [(0.0, opening)] + shots
+    dur = max([c[1] for c in subs if c[3]] or [0.0])
+    bits = _end_bits(s.get("end"))
+    if bits == ["stop"]:
+        end, prompt = ("stop", None), ""
+    elif bits[0] == "goto":
+        end, prompt = ("goto", bits[1]), ""
+    else:
+        ch = story["choices"][bits[1]]
+        f, n, _ = parse_cue_ref(ch["prompt"])
+        end, prompt = ("choice", bits[1]), files[f]["cues"][n]["text"]
+    return {"subs": [(st, en, tx) for (st, en, tx, _w) in subs], "dur": dur,
+            "actions": actions, "shots": shots, "audios": audios,
+            "end": end, "prompt": prompt}
+
+
+def set_duration(plan):
+    """Full set length incl. blocking action anims (tools/preview)."""
+    ends = [plan["dur"]]
+    for (_o, _a, at, wait, dur) in plan["actions"]:
+        if wait and dur is not None:
+            ends.append(at + dur)
+    return max(ends)
+
+
+# --------------------------------------------------------------------------
+# sync sidecar + editor schema (written by the add-on, read by game/tools)
+# --------------------------------------------------------------------------
+
+def sync_path_for(story_path):
+    """story.yml -> story.sync.json (action ranges + rename map)."""
+    root, _ = os.path.splitext(story_path)
+    return root + ".sync.json"
+
+
+def schema_path_for(story_path):
+    """story.yml -> story.schema.json (VSCode YAML completion)."""
+    root, _ = os.path.splitext(story_path)
+    return root + ".schema.json"
+
+
+def load_sidecar(path):
+    """{"uids": {uid: {"name", "type"}}, "actions": {act: [f0, f1]}}.
+
+    Missing/corrupt files yield empty maps (callers report what's missing).
+    """
+    blank = {"uids": {}, "actions": {}}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return blank
+    if not isinstance(data, dict):
+        return blank
+    uids = data.get("uids")
+    if isinstance(uids, dict):
+        blank["uids"] = uids
+    acts = data.get("actions")
+    if isinstance(acts, dict):
+        for k, v in acts.items():
+            if isinstance(v, list) and len(v) == 2 and all(
+                    type(x) in (int, float) for x in v):
+                blank["actions"][k] = [v[0], v[1]]
+    return blank
+
+
+def build_schema(story, objects, actions, cameras, srt_files, audio_files):
+    """JSON Schema dict for story.yml (VSCode $schema completion).
+
+    objects/actions/cameras/srt_files/audio_files are name lists from the
+    live scene + project scan. Regenerate on save to keep enums fresh.
+    """
+    sets = sorted(str(k) for k in story.get("sets", {}))
+    choices = sorted(str(k) for k in (story.get("choices") or {}))
+    anim_short = {
+        "type": "string",
+        "pattern": "^(subs|action|camera|audio):\\s*\\S",
+        "description": "subs: file.srt#a-b | action: Obj@Act | "
+                       "camera: Shot | audio: file.ogg"},
+    anim_full = {
+        "type": "object",
+        "properties": {
+            "subs": {"type": "string",
+                     "description": "cue range in %s"
+                     % (", ".join(sorted(srt_files)) or "no .srt found")},
+            "action": {"type": "string",
+                       "description": "Obj@Act, e.g. %s" % (
+                           ", ".join(sorted(objects)[:6]) or "no objects")},
+            "camera": {"type": "string", "enum": sorted(cameras) or ["Shot"]},
+            "audio": {"type": "string",
+                      "enum": sorted(audio_files) or ["sound.ogg"]},
+            "at": {"type": "number", "minimum": 0},
+            "wait": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+    return {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "Talking Robots story.yml",
+        "type": "object",
+        "required": ["start", "sets"],
+        "properties": {
+            "start": {"type": "string", "enum": sets or ["main"]},
+            "cps": {"type": "number", "exclusiveMinimum": 0},
+            "sets": {
+                "type": "object",
+                "patternProperties": {
+                    "^.+$": {
+                        "type": "object",
+                        "required": ["anims", "end"],
+                        "properties": {
+                            "anims": {"type": "array", "minItems": 1,
+                                      "items": {"anyOf": [anim_short,
+                                                          anim_full]}},
+                            "end": {
+                                "type": "string",
+                                "pattern": "^(stop|goto \\S+|choice \\S+)$",
+                                "description": "goto: %s; choice: %s" % (
+                                    ", ".join(sets), ", ".join(choices))},
+                        },
+                        "additionalProperties": False,
+                    }
+                },
+            },
+            "choices": {
+                "type": "object",
+                "patternProperties": {
+                    "^.+$": {
+                        "type": "object",
+                        "required": ["prompt", "options"],
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "pattern": "^\\S+#\\d+$",
+                                "description": "cue ref in %s" % (
+                                    ", ".join(sorted(srt_files))
+                                    or "no .srt found")},
+                            "options": {
+                                "type": "array", "minItems": 1,
+                                "items": {
+                                    "type": "array",
+                                    "prefixItems": [
+                                        {"description": "key 1-9"},
+                                        {"type": "string"},
+                                        {"type": "string",
+                                         "enum": sets or ["main"]}],
+                                    "minItems": 3, "maxItems": 3,
+                                },
+                            },
+                        },
+                        "additionalProperties": False,
+                    }
+                },
+            },
+        },
+        "additionalProperties": False,
+    }

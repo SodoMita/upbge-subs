@@ -1,50 +1,55 @@
-# Talking Robots story: playable sets of subtitles + object animation.
-# Subtitle TEXT lives in dialogue.srt (edit with any subtitle software);
-# MOTION lives on the timeline (keyframes on any object). This file only
-# wires them together: which cues+frames form a set, what plays at start,
-# which actors the game animates, what each end activates, and what the
-# choices offer. The game reads this file + dialogue.srt live: tweak keys,
-# retime cues, rewire sets - then press P. No rebuild, no re-export.
+# yaml-language-server=$schema=./story.schema.json
+# Talking Robots story: sets of animations played together from t=0.
+# Subtitle TEXT lives in per-set .srt files (. or ./subtitles/ - edit with
+# any subtitle software); MOTION lives in per-set Blender actions; SOUND in
+# ./audio/. This file only wires them: which anims each set plays, what
+# plays at start, and what each end activates. The game reads these files
+# live: tweak keys, retime cues, rewire sets - then press P. No rebuild.
 #
-# Workflow: add subtitles + keyframes in sync on the timeline, group them
-# into a set below (SRT cue numbers + timeline frames), pick the start set,
-# add options to a choice, and set what each set activates on its end
-# (stop | goto <set> | choice <id>). Sets ending in a choice end at their
-# prompt cue's start; the prompt text is that SRT cue's own text.
+# anims: subs (typewriter, blocks on cue-span end) | action Obj@Act (blocks
+# until done) | camera (opening shot; [CAM] cues switch; never blocks) |
+# audio (fire-and-forget; never blocks). {.., at: s} offsets, {.., wait:
+# false} marks ambience. end: stop | goto <set> | choice <id> (chains and
+# loops welcome - every set on a goto cycle needs no blocking anim only if
+# a choice or stop breaks the cycle... in fact any instant cycle errors).
 start: main
 cps: 30
-subs: dialogue.srt
-actors:
-  - Camera
-  - CubyRoot
-  - SpheroRoot
-  - CubyMouth
-  - SpheroMouth
-  - CubyArmR
-  - SpheroArmR
-  - CubyEyeL
-  - CubyEyeR
-  - SpheroEyeL
-  - SpheroEyeR
 sets:
   main:
-    cues: [1, 9]
-    frames: [1, 361]
-    lens: 50
+    anims:
+      - subs: dialogue.srt#1-8
+      - camera: Wide
+      - action: CubyRoot@main__cuby
+      - action: SpheroRoot@main__sphero
+      - action: CubyMouth@main__cubymouth
+      - action: SpheroMouth@main__spheromouth
+      - action: CubyArmR@main__cubyarm
+      - action: SpheroArmR@main__spheroarm
     end: choice pick
   cuby:
-    cues: [10, 12]
-    frames: [409, 541]
-    lens: 55
-    end: stop
+    anims:
+      - subs: cuby.srt#1-2
+      - camera: Cuby
+      - action: CubyRoot@cuby__cuby
+      - action: CubyMouth@cuby__cubymouth
+      - action: CubyArmR@cuby__cubyarm
+    end: choice pick2
   sphero:
-    cues: [13, 15]
-    frames: [553, 685]
-    lens: 45
+    anims:
+      - subs: sphero.srt#1-3
+      - camera: Sphero
+      - action: SpheroRoot@sphero__sphero
+      - action: SpheroMouth@sphero__spheromouth
+      - action: SpheroArmR@sphero__spheroarm
     end: stop
 choices:
   pick:
-    prompt_cue: 9
+    prompt: dialogue.srt#9
     options:
       - [1, "Ask Cuby about cubes", cuby]
       - [2, "Ask Sphero about spheres", sphero]
+  pick2:
+    prompt: cuby.srt#3
+    options:
+      - [1, "Hear it again", main]
+      - [2, "Ask Sphero instead", sphero]

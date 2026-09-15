@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Mock test for the sets+actors game driver (no Blender needed).
+"""Mock test for the animation-set game driver v2 (no Blender needed).
 
-Drives game_subtitles.update with a fake bge module: story loading from
-YAML+SRT fixture files, actor playback, typing, goto/choice/stop ends,
-restart, dead-data paths, actor-failure latch, capture mode, legacy
-keyboard fallback, and an end-to-end pass over the real story files.
+Drives game_subtitles.update with fake bge + aud modules: per-set plans
+from YAML+multi-SRT fixtures (story.py is loaded from the fixture dir,
+like in the engine), action blocking incl. delays, procedural camera,
+audio fire-and-forget, goto/choice/stop ends, chained choices, loops,
+restart, dead-data paths, failure latches, capture mode, legacy keyboard
+fallback, and an end-to-end pass over the real story files.
 """
+import json
 import os
 import shutil
 import sys
@@ -56,26 +59,55 @@ for _n in ("ONEKEY", "TWOKEY", "THREEKEY", "FOURKEY", "FIVEKEY", "SIXKEY",
            "ENTERKEY", "RETKEY", "SPACEKEY", "RKEY", "ESCKEY"):
     setattr(events, _n, _n)
 sys.modules["bge"] = bge
+
+# ---- fake aud ----
+aud = types.ModuleType("aud")
+PLAYED = []
+
+
+class FakeSound:
+    def __init__(self, path):
+        self.path = path
+
+
+class FakeDevice:
+    def play(self, sound):
+        PLAYED.append(sound.path)
+        return len(PLAYED)
+
+
+aud.Sound = FakeSound
+aud.device = lambda: FakeDevice()
+sys.modules["aud"] = aud
+
 sys.path.insert(0, HERE)
 import game_subtitles as gs
 
+IDENT = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+ROT_Z90 = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+
 
 class FakeObj(dict):
-    def __init__(self, name="obj", action="Act_anim"):
+    def __init__(self, name="obj", playing=True):
         super().__init__()
         self.name = name
         self.text = ""
-        self.lens = 50.0
+        self.lens = 35.0
+        self.worldPosition = [5.0, 5.0, 5.0]
+        self.worldOrientation = [r[:] for r in IDENT]
         self.worldScale = [1.0, 1.0, 1.0]
-        self.action_name = action
+        self.playing = playing
         self.calls = []
         self.visible = True
+        self.raise_play = False
 
-    def getActionName(self, layer=0):
-        return self.action_name
+    def isPlayingAction(self, layer=0):
+        return self.playing
 
     def playAction(self, action, f0, f1, layer=0, priority=0, blendin=0,
                    mode=0):
+        if self.raise_play:
+            raise RuntimeError("boom")
         self.calls.append((action, f0, f1, mode))
 
 
@@ -91,16 +123,19 @@ class FakeCont:
         own.scene = scene
 
 
-FIX = tempfile.mkdtemp(prefix="twstory")
+FIX = tempfile.mkdtemp(prefix="twgame2")
 
 
-def write_case(name, yml, srt):
+def write_case(name, files):
     d = os.path.join(FIX, name)
     os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "story.yml"), "w") as fh:
-        fh.write(yml)
-    with open(os.path.join(d, "dialogue.srt"), "w") as fh:
-        fh.write(srt)
+    shutil.copy(os.path.join(HERE, "story.py"), os.path.join(d, "story.py"))
+    for rel, content in files.items():
+        p = os.path.join(d, rel)
+        os.makedirs(os.path.dirname(p) or d, exist_ok=True)
+        mode = "wb" if isinstance(content, bytes) else "w"
+        with open(p, mode) as fh:
+            fh.write(content)
     return d
 
 
@@ -117,71 +152,79 @@ def run(cont, n, keys=None):
 
 YML1 = """start: a
 cps: 10
-subs: dialogue.srt
-actors:
-  - Camera
 sets:
   a:
-    cues: [1, 2]
-    frames: [1, 48]
-    lens: 50
+    anims:
+      - subs: a.srt#1-2
+      - camera: Wide
+      - action: R@ActA
+      - {action: R2@ActLate, at: 1.0}
+      - audio: x.ogg
     end: goto b
   b:
-    cues: [3, 5]
-    frames: [49, 200]
-    lens: 55
+    anims:
+      - subs: b.srt#1
+      - camera: Cuby
     end: choice pick
   c:
-    cues: [6, 6]
-    frames: [201, 240]
-    lens: 45
+    anims:
+      - subs: c.srt#1
     end: stop
 choices:
   pick:
-    prompt_cue: 5
+    prompt: b.srt#2
     options:
       - [1, "See C", c]
       - [2, "Back to A", a]
 """
-SRT1 = """1
+SRTA = """1
 00:00:00,000 --> 00:00:01,000
 CUBY: Hi.
 
 2
 00:00:01,000 --> 00:00:02,000
+[CAM Cuby]
 SPHERO: Yo.
-
-3
+"""
+SRTB = """1
 00:00:00,000 --> 00:00:01,000
 CUBY: Bee.
 
-4
-00:00:01,500 --> 00:00:02,500
-Gap holder.
-
-5
-00:00:03,000 --> 00:00:04,000
+2
+00:00:01,000 --> 00:00:02,000
 Pick now?
-
-6
+"""
+SRTC = """1
 00:00:00,000 --> 00:00:01,000
 CUBY: Cee.
 """
-CASE1 = write_case("case1", YML1, SRT1)
+SYNC1 = {"uids": {}, "actions": {"ActA": [1, 61], "ActLate": [1, 31]}}
+CASE1 = write_case("case1", {"story.yml": YML1, "a.srt": SRTA, "b.srt": SRTB,
+                             "c.srt": SRTC, "audio/x.ogg": b"RIFF....",
+                             "story.sync.json": json.dumps(SYNC1)})
 
 
 def make_cont(case, capture=False):
     CURRENT[0] = case
-    own = FakeObj("GameDirector", action="")
+    own = FakeObj("GameDirector", playing=False)
     own["tw_story"] = "//story.yml"
     if capture:
         own["CAPTURE"] = 1
-    cam = FakeObj("Camera", "Camera_anim")
-    sub = FakeObj("Subtitles", "")
-    menu = FakeObj("ChoiceMenu", "")
-    subline = FakeObj("SubLine01", "")
-    scene = FakeScene([own, cam, sub, menu, subline])
-    return FakeCont(own, scene), own, scene, cam, sub, menu
+    cam = FakeObj("Camera", playing=False)
+    wide = FakeObj("Wide", playing=False)
+    wide.worldPosition = [0.0, 0.0, 10.0]
+    wide.lens = 50.0
+    cuby = FakeObj("Cuby", playing=False)
+    cuby.worldPosition = [10.0, 0.0, 0.0]
+    cuby.worldOrientation = [r[:] for r in ROT_Z90]
+    cuby.lens = 55.0
+    sub = FakeObj("Subtitles", playing=False)
+    menu = FakeObj("ChoiceMenu", playing=False)
+    line = FakeObj("main_Line01", playing=False)
+    robjs = {"R": FakeObj("R"), "R2": FakeObj("R2")}
+    scene = FakeScene([own, cam, wide, cuby, sub, menu, line,
+                       robjs["R"], robjs["R2"]])
+    return FakeCont(own, scene), own, scene, cam, sub, menu, robjs
 
 
 def log_text(case):
@@ -189,20 +232,37 @@ def log_text(case):
         return fh.read()
 
 
-# 1) init: start set entered, actor played once, lens set
-cont, own, scene, cam, sub, menu = make_cont(CASE1)
+def col_norms(m):
+    import math
+    return [math.sqrt(sum(m[r][c] ** 2 for r in range(3))) for c in range(3)]
+
+
+# 1) init: start set, actions by sidecar range, camera easing, audio, hiding
+del PLAYED[:]
+cont, own, scene, cam, sub, menu, robjs = make_cont(CASE1)
 run(cont, 1)
 assert own["tw_set"] == "a" and own["tw_state"] == "play"
-assert cam.calls == [("Camera_anim", 1, 48, 7)], cam.calls
-assert cam.lens == 50
-assert scene.active_camera is cam
+assert robjs["R"].calls == [("ActA", 1, 61, 7)], robjs["R"].calls
+assert robjs["R2"].calls == []  # at: 1.0, not due
+assert PLAYED == [os.path.join(CASE1, "audio", "x.ogg")], PLAYED
 assert menu.text == ""
-assert scene.objects["SubLine01"].visible is False
-assert "init ok: 3 sets 6 cues 1 actors" in log_text(CASE1)
+assert scene.objects["main_Line01"].visible is False
+assert scene.active_camera is cam
+assert cam.worldPosition != [5.0, 5.0, 5.0]  # easing toward Wide
+assert "init ok: 3 sets 4 cues 2 actions" in log_text(CASE1)
 print("init/load ok")
 
-# 2) typing
-run(cont, 29)
+# 2) camera settles on the opening shot
+run(cont, 39)  # tick 40: blend (30 ticks) done
+assert cam.worldPosition == [0.0, 0.0, 10.0], cam.worldPosition
+assert cam.worldOrientation == IDENT
+assert cam.lens == 50.0
+print("camera open ok")
+
+# 3) typing at 10 cps
+run(cont, 1)  # tick 41... use fresh timing below instead
+cont, own, scene, cam, sub, menu, robjs = make_cont(CASE1)
+run(cont, 30)
 assert sub.text == "CUBY:", repr(sub.text)  # 0.5 s * 10 cps
 run(cont, 30)
 assert sub.text == "", repr(sub.text)  # cue 2 just started
@@ -210,151 +270,165 @@ run(cont, 10)
 assert sub.text == "S", repr(sub.text)
 print("typing ok")
 
-# 3) goto end
-run(cont, 50)  # tick 120, t = 2.0 -> goto b
-assert own["tw_set"] == "b", own["tw_set"]
-assert cam.calls[-1] == ("Camera_anim", 49, 200, 7)
-assert cam.lens == 55
-assert "goto set 'b'" in log_text(CASE1)
-print("goto ok")
+# 4) delayed action starts when due (t = 1.0, tick 60)
+assert robjs["R2"].calls == [("ActLate", 1, 31, 7)], robjs["R2"].calls
+print("delayed action ok")
 
-# 4) gap hold + choice entry at prompt start (t = 3.0, tick 300)
-run(cont, 72)  # tick 192, local t = 1.2: inside the 1.0-1.5 gap
-assert sub.text == "CUBY: Bee.", repr(sub.text)
-run(cont, 108)  # tick 300
+# 5) [CAM] cut mid-set: blend Wide -> Cuby, orientation stays valid
+assert cam.worldPosition != [0.0, 0.0, 10.0]  # blend restarted at tick 60
+run(cont, 10)  # tick 80, mid-blend
+for n in col_norms(cam.worldOrientation):
+    assert abs(n - 1.0) < 0.01, (n, cam.worldOrientation)
+run(cont, 20)  # tick 100: settled
+assert cam.worldPosition == [10.0, 0.0, 0.0], cam.worldPosition
+assert cam.worldOrientation == ROT_Z90
+assert cam.lens == 55.0
+print("camera cut ok")
+
+# 6) wait-actions block past subs end; goto fires when all done
+run(cont, 20)  # tick 120, t = 2.0, subs over, both still playing
+assert own["tw_set"] == "a", own["tw_set"]
+robjs["R"].playing = False
+run(cont, 1)
+assert own["tw_set"] == "a"  # R2 still playing
+robjs["R2"].playing = False
+run(cont, 1)
+assert own["tw_set"] == "b", own["tw_set"]  # tick 122
+assert "goto set 'b'" in log_text(CASE1)
+print("blocking/goto ok")
+
+# 7) choice entry at subs end (b dur 1.0 -> tick 182)
+run(cont, 60)
 assert own["tw_state"] == "choice", own["tw_state"]
 assert sub.text == "Pick now?"
 assert menu.text == "> 1: See C\n  2: Back to A", repr(menu.text)
 assert "choice 'pick' (2 options)" in log_text(CASE1)
 print("choice entry ok")
 
-# 5) nav + confirm
+# 8) nav + confirm + restart + direct-key loop back through the choice
 run(cont, 1, {1: ["DOWNARROWKEY"]})
 assert own["tw_ci"] == 1 and menu.text.startswith("  1: See C")
 run(cont, 1, {1: ["UPARROWKEY"]})
 assert own["tw_ci"] == 0
 run(cont, 1, {1: ["ENTERKEY"]})
 assert own["tw_set"] == "c", own["tw_set"]
-assert cam.calls[-1] == ("Camera_anim", 201, 240, 7)
-assert cam.lens == 45 and menu.text == ""
+assert menu.text == ""
 assert "option 1 'See C' -> set 'c'" in log_text(CASE1)
-print("choice nav/confirm ok")
-
-# 6) R restart + direct-key pick
 run(cont, 1, {1: ["RKEY"]})
 assert own["tw_set"] == "a" and own["tw_state"] == "play"
-run(cont, 120)  # -> b
-assert own["tw_set"] == "b"
-run(cont, 180)  # -> choice
+run(cont, 120)  # R/R2 done now -> straight through at subs end
+assert own["tw_set"] == "b", own["tw_set"]
+run(cont, 60)
 assert own["tw_state"] == "choice"
 run(cont, 1, {1: ["TWOKEY"]})
 assert own["tw_set"] == "a", own["tw_set"]
-print("restart/direct-key ok")
+print("choice/rest/loop ok")
 
-# 7) capture: auto-pick, screenshots, auto-quit at story end
-shots0, ended0 = len(SHOTS), len(ENDED)
-cont2, own2, *_ = make_cont(CASE1, capture=True)
-run(cont2, 120)  # -> b
-run(cont2, 180)  # -> choice
-run(cont2, 30)  # auto-picks option 1
-assert own2["tw_set"] == "c", own2["tw_set"]
-assert "capture auto-picks option 1" in log_text(CASE1)
-run(cont2, 60)  # c ends -> stop
-assert own2["tw_state"] == "stop"
-run(cont2, 121)  # past STOP_HOLD -> endGame
-assert len(ENDED) == ended0 + 1
-assert len(SHOTS) - shots0 >= 100
-print("capture ok (%d screenshots)" % (len(SHOTS) - shots0))
-
-# 8) stop: last line lingers, then the replay hint
-cont3, own3, _, _, sub3, _ = make_cont(CASE1)
-run(cont3, 120)
-run(cont3, 180)
-run(cont3, 1, {1: ["ENTERKEY"]})
-run(cont3, 60)  # tick 361: c ends
-assert own3["tw_state"] == "stop" and sub3.text == "CUBY: Cee."
-run(cont3, 121)
-assert sub3.text == "R = replay!   ESC = quit"
+# 9) stop: last line lingers, then the replay hint
+run(cont, 120)  # -> b
+run(cont, 60)  # -> choice
+run(cont, 1, {1: ["ENTERKEY"]})  # -> c
+run(cont, 60)  # c dur 1.0 -> stop
+assert own["tw_state"] == "stop" and sub.text == "CUBY: Cee."
+run(cont, 121)
+assert sub.text == "R = replay!   ESC = quit"
 print("stop/hint ok")
 
-# 9) ESC quits without advancing the tick
+# 10) ESC quits without advancing the tick
 n_end = len(ENDED)
 tick_before = own["tick"]
 run(cont, 1, {1: ["ESCKEY"]})
 assert len(ENDED) == n_end + 1 and own["tick"] == tick_before
 print("esc ok")
 
-# 10) dead data: missing file, bad YAML, failed check
-cont4, own4, _, _, sub4, _ = make_cont(CASE1)
+# 11) dead data: missing file, bad YAML, story error, no story.py, no range
+cont4, own4, _, _, sub4, _, _ = make_cont(CASE1)
 own4["tw_story"] = "//nope.yml"
 run(cont4, 1)
 assert "tw_dead" in own4 and sub4.text.startswith("No dialogue data")
 assert "INIT FAILED" in log_text(CASE1)
-write_case("badyaml", "sets: [oops\n", SRT1)
-cont5, own5, _, _, sub5, _ = make_cont(os.path.join(FIX, "badyaml"))
+CASEB = write_case("badyaml", {"story.yml": "sets: [oops\n"})
+cont5, own5, _, _, sub5, _, _ = make_cont(CASEB)
 run(cont5, 1)
 assert "tw_dead" in own5 and sub5.text.startswith("No dialogue data")
-write_case("badcheck", YML1.replace("start: a", "start: nope"), SRT1)
-cont6, own6, *_ = make_cont(os.path.join(FIX, "badcheck"))
+CASEC = write_case("badcheck", {"story.yml": YML1.replace("start: a",
+                                                          "start: nope"),
+                                "a.srt": SRTA, "b.srt": SRTB, "c.srt": SRTC,
+                                "audio/x.ogg": b"RIFF....",
+                                "story.sync.json": json.dumps(SYNC1)})
+cont6, own6, *_ = make_cont(CASEC)
 run(cont6, 1)
 assert "tw_dead" in own6 and "'start' must name" in own6["tw_dead"]
+CASEN = write_case("nolib", {"story.yml": YML1})
+os.remove(os.path.join(CASEN, "story.py"))
+cont7, own7, *_ = make_cont(CASEN)
+run(cont7, 1)
+assert "tw_dead" in own7 and "story.py" in own7["tw_dead"]
+CASER = write_case("norange", {"story.yml": YML1, "a.srt": SRTA, "b.srt": SRTB,
+                               "c.srt": SRTC, "audio/x.ogg": b"RIFF....",
+                               "story.sync.json": json.dumps({"actions": {}})})
+cont8, own8, *_ = make_cont(CASER)
+run(cont8, 1)
+assert "tw_dead" in own8 and "frame range" in own8["tw_dead"]
 print("dead-data ok")
 
-# 11) missing actors latch (logged once, play continues)
-YMLA = YML1.replace("actors:\n  - Camera",
-                    "actors:\n  - Camera\n  - Ghost\n  - NoAct")
-YMLA = YMLA.replace("end: goto b", "end: stop", 1)
-CASEA = write_case("actors", YMLA, SRT1)
-CURRENT[0] = CASEA
-ownA = FakeObj("GameDirector", action="")
-ownA["tw_story"] = "//story.yml"
-camA = FakeObj("Camera", "Camera_anim")
-noact = FakeObj("NoAct", "")
-contA = FakeCont(ownA, FakeScene([ownA, camA, noact,
-                                  FakeObj("Subtitles", ""),
-                                  FakeObj("ChoiceMenu", "")]))
-run(contA, 1)
-assert camA.calls == [("Camera_anim", 1, 48, 7)]
-run(contA, 200)
-logA = log_text(CASEA)
-assert logA.count("actor 'Ghost' unavailable (missing object)") == 1, logA
-assert logA.count("actor 'NoAct' unavailable (no action on layer 0)") == 1
-run(contA, 1, {1: ["RKEY"]})  # re-enter: still no repeats
-run(contA, 5)
-logA = log_text(CASEA)
-assert logA.count("actor 'Ghost'") == 1 and logA.count("NoAct") == 1
-assert len(camA.calls) == 2  # the working actor replays fine
+# 12) failed actors latch once and never hang the set
+YMLG = YML1.replace("- action: R@ActA", "- action: Ghost@ActA")
+YMLG = YMLG.replace("end: goto b", "end: stop", 1)
+CASEG = write_case("ghost", {"story.yml": YMLG, "a.srt": SRTA, "b.srt": SRTB,
+                             "c.srt": SRTC, "audio/x.ogg": b"RIFF....",
+                             "story.sync.json": json.dumps(SYNC1)})
+CURRENT[0] = CASEG
+ownG = FakeObj("GameDirector", playing=False)
+ownG["tw_story"] = "//story.yml"
+camG = FakeObj("Camera", playing=False)
+wideG = FakeObj("Wide", playing=False)
+wideG.worldPosition = [0.0, 0.0, 10.0]
+wideG.lens = 50.0
+contG = FakeCont(ownG, FakeScene([ownG, camG, wideG,
+                                  FakeObj("Subtitles", playing=False),
+                                  FakeObj("ChoiceMenu", playing=False)]))
+run(contG, 125)  # subs dur 2.0; Ghost+R2 missing but wait anyway
+assert ownG["tw_state"] == "stop", ownG["tw_state"]
+logG = log_text(CASEG)
+assert logG.count("actor 'Ghost' unavailable (missing object)") == 1, logG
+run(contG, 1, {1: ["RKEY"]})  # re-enter: still no repeats
+run(contG, 5)
+logG = log_text(CASEG)
+assert logG.count("actor 'Ghost'") == 1
 print("actor latch ok")
 
-# 12) capture budget quits
+# 13) capture budget quits
 saved_cap = gs.CAP_TICKS
 gs.CAP_TICKS = 60
 try:
     n_end = len(ENDED)
-    cont7, *_ = make_cont(CASE1, capture=True)
-    run(cont7, 60)
+    cont9, *_ = make_cont(CASE1, capture=True)
+    run(cont9, 60)
     assert len(ENDED) == n_end + 1
     assert "capture budget hit" in log_text(CASE1)
 finally:
     gs.CAP_TICKS = saved_cap
 print("capture budget ok")
 
-# 13) log needles incl. heartbeat
+# 14) log needles incl. heartbeat
 run(cont, 600)
 log1 = log_text(CASE1)
 for needle in ("enter set 'a' (init)", "tick 5 t=", "heartbeat tick="):
     assert needle in log1, needle
 print("log ok (%d bytes)" % len(log1))
 
-# 14) legacy keyboard (no .inputs) falls back to .events
+# 15) legacy keyboard (no .inputs) falls back to .events
 legacy = LegacyKeyboard()
 CURRENT[0] = CASE1
-ownL = FakeObj("GameDirector", action="")
+ownL = FakeObj("GameDirector", playing=False)
 ownL["tw_story"] = "//story.yml"
-camL = FakeObj("Camera", "Camera_anim")
-subL = FakeObj("Subtitles", "")
-contL = FakeCont(ownL, FakeScene([ownL, camL, subL,
-                                  FakeObj("ChoiceMenu", "")]))
+camL = FakeObj("Camera", playing=False)
+wideL = FakeObj("Wide", playing=False)
+subL = FakeObj("Subtitles", playing=False)
+contL = FakeCont(ownL, FakeScene([ownL, camL, wideL, subL,
+                                  FakeObj("ChoiceMenu", playing=False),
+                                  FakeObj("R"), FakeObj("R2")]))
 saved_kb = logic.keyboard
 logic.keyboard = legacy
 try:
@@ -364,42 +438,72 @@ try:
     assert subL.text == "CUBY:", repr(subL.text)
     legacy.events = {"RKEY": 1}
     gs.update(contL)
-    assert ownL["tw_t0"] == 30 and subL.text == "", (ownL.get("tw_t0"), subL.text)
+    assert ownL["tw_t0"] == 30 and subL.text == "", (ownL.get("tw_t0"),
+                                                    subL.text)
 finally:
     logic.keyboard = saved_kb
 print("legacy keyboard fallback ok")
 
-# 15) end-to-end over the real story files
+# 16) end-to-end over the real story files (chained choice + loop)
 CURRENT[0] = HERE
-ownR = FakeObj("GameDirector", action="")
+ownR = FakeObj("GameDirector", playing=False)
 ownR["tw_story"] = "//story.yml"
-names = ["Camera", "CubyRoot", "SpheroRoot", "CubyMouth", "SpheroMouth",
-         "CubyArmR", "SpheroArmR", "CubyEyeL", "CubyEyeR", "SpheroEyeL",
-         "SpheroEyeR"]
-robjs = {n: FakeObj(n, n + "_anim") for n in names}
-subR = FakeObj("Subtitles", "")
-menuR = FakeObj("ChoiceMenu", "")
-contR = FakeCont(ownR, FakeScene([ownR, subR, menuR, FakeObj("SubLine01", ""),
-                                  FakeObj("SubLine02", "")] + list(robjs.values())))
+names = ["CubyRoot", "SpheroRoot", "CubyMouth", "SpheroMouth", "CubyArmR",
+         "SpheroArmR"]
+robjsR = {n: FakeObj(n, playing=False) for n in names}
+camR = FakeObj("Camera", playing=False)
+staged = {}
+for n, pos, lens in (("Wide", [0.0, 0.0, 10.0], 50.0),
+                     ("Cuby", [10.0, 0.0, 0.0], 55.0),
+                     ("Sphero", [-10.0, 0.0, 0.0], 45.0)):
+    o = FakeObj(n, playing=False)
+    o.worldPosition = pos
+    o.lens = lens
+    staged[n] = o
+subR = FakeObj("Subtitles", playing=False)
+menuR = FakeObj("ChoiceMenu", playing=False)
+contR = FakeCont(ownR, FakeScene([ownR, camR, subR, menuR,
+                                  FakeObj("main_Line01", playing=False),
+                                  FakeObj("cuby_Line01", playing=False)]
+                                 + list(staged.values())
+                                 + list(robjsR.values())))
 run(contR, 1)
 assert ownR["tw_set"] == "main"
-assert robjs["Camera"].calls == [("Camera_anim", 1, 361, 7)]
-assert robjs["CubyRoot"].calls == [("CubyRoot_anim", 1, 361, 7)]
-assert robjs["Camera"].lens == 50
-assert contR.owner.scene.objects["SubLine01"].visible is False
-assert contR.owner.scene.objects["SubLine02"].visible is False
-run(contR, 899)  # tick 900, t = 15.0 -> choice at prompt start
+assert robjsR["CubyRoot"].calls == [("main__cuby", 1, 361, 7)]
+assert robjsR["CubyArmR"].calls == [("main__cubyarm", 1, 361, 7)]
+assert contR.owner.scene.objects["main_Line01"].visible is False
+assert contR.owner.scene.objects["cuby_Line01"].visible is False
+run(contR, 39)  # opening blend done
+assert camR.lens == 50.0, camR.lens
+assert camR.worldPosition == [0.0, 0.0, 10.0]
+run(contR, 185)  # tick 225, t = 3.75: cue 3 [CAM Cuby] cut starts
+assert camR.worldPosition != [0.0, 0.0, 10.0]
+run(contR, 30)  # settled on Cuby
+assert camR.lens == 55.0, camR.lens
+assert camR.worldPosition == [10.0, 0.0, 0.0]
+run(contR, 645)  # tick 900, t = 15.0 -> choice pick
 assert ownR["tw_state"] == "choice", ownR["tw_state"]
 assert subR.text == "Who gets the last word?", repr(subR.text)
 assert menuR.text == ("> 1: Ask Cuby about cubes\n"
                       "  2: Ask Sphero about spheres"), repr(menuR.text)
 run(contR, 1, {1: ["ENTERKEY"]})
 assert ownR["tw_set"] == "cuby"
-assert robjs["Camera"].calls[-1] == ("Camera_anim", 409, 541, 7)
-assert robjs["Camera"].lens == 55
+assert robjsR["CubyRoot"].calls[-1] == ("cuby__cuby", 1, 91, 7)
+run(contR, 225)  # 3.75 s -> choice pick2 (chained choice)
+assert ownR["tw_state"] == "choice", ownR["tw_state"]
+assert subR.text == "CUBY: Stay square,\nfriend!", repr(subR.text)
+run(contR, 1, {1: ["ONEKEY"]})
+assert ownR["tw_set"] == "main", ownR["tw_set"]  # loop back
+assert menuR.text == ""
+run(contR, 900)  # main again -> choice pick
+assert ownR["tw_state"] == "choice"
+run(contR, 1, {1: ["TWOKEY"]})
+assert ownR["tw_set"] == "sphero"
 run(contR, 330)  # 5.5 s -> stop
 assert ownR["tw_state"] == "stop", ownR["tw_state"]
-assert subR.text.startswith("CUBY: Stay square"), repr(subR.text)
+assert subR.text.startswith("SPHERO: Stay round"), repr(subR.text)
+logR = log_text(HERE)
+assert "init ok: 3 sets 13 cues 12 actions" in logR, logR[:400]
 print("real-story integration ok")
 
 shutil.rmtree(FIX, ignore_errors=True)

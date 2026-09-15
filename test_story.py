@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
-"""Tests for story.py: YAML subset, SRT+[CAM] parse, validation, spans.
+"""Tests for story.py v2: YAML subset + flow maps, refs, plans, sync/schema.
 
-No Blender needed. Also checks the game driver's embedded parser copies
-agree with story.py, and the add-on's strip copy agrees (AST extract).
+No Blender needed. Also checks the add-on's strip copy agrees (AST extract).
 """
 import ast
 import copy
+import json
 import os
 import re
+import shutil
 import sys
-import types
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import story
-
-# ---- game driver import (fake bge; parsers only, no engine calls) ----
-bge = types.ModuleType("bge")
-bge.logic = types.ModuleType("bge.logic")
-bge.events = types.ModuleType("bge.events")
-sys.modules["bge"] = bge
-import game_subtitles as gs
 
 Y = story.parse_minimal_yaml
 
@@ -34,7 +28,7 @@ def yerr(text, needle):
     raise AssertionError("no error for %r" % text)
 
 
-# 1) YAML subset: values
+# 1) YAML subset: values incl. flow maps
 assert Y("a: 1\nb: x") == {"a": 1, "b": "x"}
 assert Y("a:\n  b: 2\n  c:\n    - 1\n    - x") == \
     {"a": {"b": 2, "c": [1, "x"]}}
@@ -51,6 +45,13 @@ assert Y("") == {}
 assert Y("a:\n  - [1, \"Ask\", cuby]\n  - [2, Tell, sphero]") == \
     {"a": [[1, "Ask", "cuby"], [2, "Tell", "sphero"]]}
 assert Y("end: choice pick") == {"end": "choice pick"}
+assert Y("a: {}") == {"a": {}}
+assert Y("a: {x: 1, y: [p, {z: q}]}") == \
+    {"a": {"x": 1, "y": ["p", {"z": "q"}]}}
+assert Y("a:\n  - {subs: f.srt#1-2, at: 3.0}\n  - action: O@A") == \
+    {"a": [{"subs": "f.srt#1-2", "at": 3.0}, "action: O@A"]}
+assert Y("a: {q: 'it''s #1'}") == {"a": {"q": "it's #1"}}
+assert Y("a: f.srt#1-8  # tail") == {"a": "f.srt#1-8"}
 print("yaml values ok")
 
 # 2) YAML subset: errors
@@ -61,152 +62,252 @@ yerr("a: 1\na: 2", "duplicate key")
 yerr("a:\n    b: 1\n  c: 2", "bad indentation")
 yerr("a: 1\n- x", "list item inside a mapping")
 yerr("a: [1, 2", "flow list")
-yerr("a: {k: v}", "block style")
 yerr('a: ["x]', "unterminated string")
 yerr("a: [1] x", "trailing")
 yerr("a: [1,,2]", "unexpected")
 yerr(": v", "empty key")
+yerr("a: {k}", "key: value")
+yerr("a: {k: 1, k: 2}", "duplicate key")
+yerr("a: {k: 1]", "'}' in flow map")
+yerr("a:\n  - k: v\n    x: 1", "flow style")
 print("yaml errors ok")
 
-# 3) SRT simple parse
+# 3) anim references
+assert story.parse_subs_ref("f.srt#1-8") == ("f.srt", 1, 8, "")
+assert story.parse_subs_ref("f.srt#9") == ("f.srt", 9, 9, "")
+assert story.parse_subs_ref("f.srt#x")[3] != ""
+assert story.parse_subs_ref("f.srt#8-1")[3] != ""
+assert story.parse_subs_ref("f.srt")[3] != ""
+assert story.parse_cue_ref("f.srt#9") == ("f.srt", 9, "")
+assert story.parse_cue_ref("f.srt#1-2")[2] != ""
+assert story.parse_action_ref("O@A") == ("O", "A", "")
+assert story.parse_action_ref("O@")[2] != ""
+assert story.parse_action_ref("OA")[2] != ""
+print("refs ok")
+
+# 4) anim normalization
+a, e = story.normalize_anim("subs: f.srt#1-2")
+assert e == "" and a == {"type": "subs", "value": "f.srt#1-2",
+                         "at": 0.0, "wait": True}, (a, e)
+a, e = story.normalize_anim({"action": "O@A", "at": 2, "wait": False})
+assert e == "" and a == {"type": "action", "value": "O@A",
+                         "at": 2.0, "wait": False}, (a, e)
+a, e = story.normalize_anim("camera: Wide")
+assert e == "" and a["wait"] is False
+a, e = story.normalize_anim("audio: x.ogg")
+assert e == "" and a["wait"] is False
+for bad in ("dance: now", "subs:", {"subs": "f#1", "zz": 1},
+            {"action": "O@A", "at": -1}, {"subs": "f#1", "wait": "yes"},
+            {"subs": "f#1", "audio": "x"}, ["subs: f#1"], 42):
+    assert story.normalize_anim(bad)[1] != "", bad
+print("anims ok")
+
+# 5) SRT + script parse ([CAM] passes through unvalidated)
 SRT = ("1\n00:00:01,000 --> 00:00:02,000\n[CAM Cuby]\nCUBY: Hi.\n\n"
        "2\n00:00:03,000 --> 00:00:04,000\nPlain [laughs] ok.\n")
 cues = story.parse_srt_simple(SRT)
 assert cues == {1: {"start": 1.0, "end": 2.0, "text": "CUBY: Hi."},
-                2: {"start": 3.0, "end": 4.0, "text": "Plain [laughs] ok."}}, cues
-assert story.parse_srt_simple("00:00:01,000 --> 00:00:02,000\nNo number.\n") == \
-    {1: {"start": 1.0, "end": 2.0, "text": "No number."}}
-assert story.parse_srt_simple("garbage\n\nno timing here\n") == {}
-assert story.parse_srt_simple(
-    "1\n00:00:01,000 --> 00:00:01,000\nX.\n")[1]["end"] == 2.0
+                2: {"start": 3.0, "end": 4.0, "text": "Plain [laughs] ok."}}
+scr = story.parse_script(
+    "1\n00:00:01,000 --> 00:00:02,000\n[CAM Whatever]\n[BRANCH x]\nHi.\n")
+assert scr["errors"] == [] and len(scr["warnings"]) == 1, scr
+assert scr["cams"] == [[1.0, "Whatever", 1]]
+bare = story.parse_script("1\n00:00:01,000 --> 00:00:02,000\n[CAM]\nX.\n")
+assert bare["errors"] == ["[CAM] needs a shot name (cue 1)"]
+assert story.parse_script("nothing here")["errors"] != []
 print("srt parse ok")
 
-# 4) script parse (cams + legacy + errors)
-scr = story.parse_script(
-    "1\n00:00:01,000 --> 00:00:02,000\n[CAM Cuby]\n[BRANCH x]\nHi.\n")
-assert scr["errors"] == [] and len(scr["warnings"]) == 1, scr
-assert "legacy" in scr["warnings"][0] and scr["cams"] == [[1.0, "Cuby"]], scr
-bad = story.parse_script("1\n00:00:01,000 --> 00:00:02,000\n[CAM Nope]\nX.\n")
-assert len(bad["errors"]) == 1 and "unknown shot" in bad["errors"][0], bad
-bare = story.parse_script("1\n00:00:01,000 --> 00:00:02,000\n[CAM]\nX.\n")
-assert len(bare["errors"]) == 1 and "needs a shot name" in bare["errors"][0]
-assert story.parse_script("nothing here")["errors"] != []
-print("script parse ok")
-
-# 5) check_story: one good story, many bad ones
-CUES = {1: {"start": 0.0, "end": 1.0, "text": "a"},
-        2: {"start": 1.0, "end": 2.0, "text": "b"},
-        3: {"start": 5.0, "end": 6.0, "text": "c"}}
-STORY_OK = {"start": "a", "cps": 10, "subs": "d.srt", "actors": ["Camera"],
+# 6) check_story incl. instant loops
+FILES = {"a.srt": {"cues": {1: {"start": 0.0, "end": 1.0, "text": "a"},
+                            2: {"start": 1.0, "end": 2.0, "text": "b"}}},
+         "b.srt": {"cues": {1: {"start": 0.0, "end": 1.0, "text": "c"}}}}
+STORY_OK = {"start": "a", "cps": 10,
             "sets": {
-                "a": {"cues": [1, 2], "frames": [1, 48], "lens": 50,
+                "a": {"anims": ["subs: a.srt#1-2", "camera: Wide",
+                                "action: O@A"],
                       "end": "goto b"},
-                "b": {"cues": [3, 3], "frames": [49, 60], "lens": 45,
-                      "end": "stop"}},
-            "choices": {}}
-assert story.check_story(STORY_OK, CUES) == []
-CH_OK = copy.deepcopy(STORY_OK)
-CH_OK["sets"]["b"]["end"] = "choice pick"
-CH_OK["choices"] = {"pick": {"prompt_cue": 3,
-                             "options": [[1, "Go A", "a"],
-                                         ["2", "Go B", "b"]]}}
-assert story.check_story(CH_OK, CUES) == []
+                "b": {"anims": ["subs: b.srt#1"], "end": "choice pick"}},
+            "choices": {"pick": {"prompt": "b.srt#1",
+                                 "options": [[1, "Go A", "a"],
+                                             ["2", "Go B", "b"]]}}}
+assert story.check_story(STORY_OK, FILES) == []
 
 
 def chk(mut, needle):
-    s = copy.deepcopy(CH_OK)
+    s = copy.deepcopy(STORY_OK)
     mut(s)
-    errs = story.check_story(s, CUES)
+    errs = story.check_story(s, FILES)
     assert any(needle in e for e in errs), (needle, errs)
-    # the driver's embedded copy must agree exactly
-    assert gs.check_story(s, CUES) == errs, (needle, errs)
 
 
 chk(lambda s: s.update(start="nope"), "'start' must name")
-chk(lambda s: s["sets"]["a"].update(cues=[1]), "'cues' must be")
-chk(lambda s: s["sets"]["a"].update(cues=[2, 1]), "must rise")
-chk(lambda s: s["sets"]["a"].update(cues=[1, 9]), "not in dialogue.srt")
-chk(lambda s: s["sets"]["a"].update(frames=[0, 5]), "frames must start")
-chk(lambda s: s["sets"]["a"].update(lens=0), "'lens' must be")
+chk(lambda s: s["sets"]["a"].update(anims=[]), "non-empty 'anims'")
+chk(lambda s: s["sets"]["a"]["anims"].append("dance: x"), "unknown type")
+chk(lambda s: s["sets"]["a"]["anims"].__setitem__(0, "subs: z.srt#1"),
+    "not found")
+chk(lambda s: s["sets"]["a"]["anims"].__setitem__(0, "subs: a.srt#1-9"),
+    "cue 3 is not in")
+chk(lambda s: s["sets"]["a"]["anims"].__setitem__(2, "action: O"),
+    "must be 'Object@Action'")
+chk(lambda s: s["sets"]["a"]["anims"].append("camera: Two"),
+    "only one 'camera'")
 chk(lambda s: s["sets"]["a"].update(end="fly away"), "'end' must be")
 chk(lambda s: s["sets"]["a"].update(end="goto nope"), "unknown set")
 chk(lambda s: s["sets"]["b"].update(end="choice nope"), "unknown choice")
-chk(lambda s: s["choices"]["pick"].update(prompt_cue=9), "'prompt_cue'")
+chk(lambda s: s["choices"]["pick"].update(prompt="b.srt#7"), "cue 7")
 chk(lambda s: s["choices"]["pick"].update(options=[]), "non-empty 'options'")
 chk(lambda s: s["choices"]["pick"]["options"].append([1]), "must be [key, label, set]")
 chk(lambda s: s["choices"]["pick"]["options"][0].__setitem__(0, "x"),
     "key must be 1-9")
 chk(lambda s: s["choices"]["pick"]["options"][0].__setitem__(1, " "),
     "label must be")
-chk(lambda s: s.update(subs=""), "'subs' must be")
-chk(lambda s: s.update(actors=[]), "'actors' must be")
 chk(lambda s: s.update(cps=0), "'cps' must be")
-assert story.check_story([], CUES) == ["story must be a mapping of key: value lines"]
-print("check_story ok (driver copy agrees)")
+assert story.check_story([], FILES) == ["story must be a mapping of key: value lines"]
 
-# 6) range checks
-assert story.range_checks(CH_OK, CUES, 1, 708) == []
-r = copy.deepcopy(CH_OK)
-r["sets"]["a"]["frames"] = [1, 999]
-assert any("exceed the timeline" in e
-           for e in story.range_checks(r, CUES, 1, 708))
-r = copy.deepcopy(CH_OK)
-r["sets"]["b"]["cues"] = [3, 3]
-r["choices"]["pick"]["prompt_cue"] = 1
-assert any("outside set" in e for e in story.range_checks(r, CUES, 1, 708))
-print("range checks ok")
 
-# 7) cam spans (starter timings pin the 9 baked spans)
+def loop_case(ends, anims):
+    s = {"start": "a", "cps": 10, "sets": {}, "choices": {}}
+    for name, end in ends.items():
+        s["sets"][name] = {"anims": anims.get(name, ["camera: Wide"]),
+                           "end": end}
+    return story.check_story(s, FILES)
+
+
+assert any("loop" in e for e in
+           loop_case({"a": "goto a"}, {}))
+assert any("loop" in e for e in
+           loop_case({"a": "goto b", "b": "goto a"}, {}))
+assert loop_case({"a": "goto b", "b": "stop"},
+                 {"a": ["subs: a.srt#1-2"]}) == []
+assert loop_case({"a": "goto b", "b": "goto a"},
+                 {"b": ["action: O@A"]}) == []
+print("check_story ok")
+
+# 7) warnings: silence, echo, ignored wait, reachability
+W = copy.deepcopy(STORY_OK)
+W["sets"]["b"]["anims"] = ["subs: b.srt#1",
+                           {"camera": "Wide", "wait": True}]
+FILES2 = copy.deepcopy(FILES)
+FILES2["b.srt"]["cues"][1] = {"start": 5.0, "end": 6.0, "text": "c"}
+warns = story.warn_story(W, FILES2)
+assert any("leading silence" in w for w in warns), warns
+assert any("never blocks" in w for w in warns), warns
+W["sets"]["b"]["anims"] = ["subs: a.srt#1-2"]
+W["choices"]["pick"]["prompt"] = "a.srt#2"
+assert any("shows twice" in w for w in story.warn_story(W, FILES))
+W["sets"]["zzz"] = {"anims": ["subs: a.srt#1"], "end": "stop"}
+W["choices"]["never"] = {"prompt": "a.srt#1", "options": [[1, "X", "a"]]}
+warns = story.warn_story(W, FILES)
+assert any("unreachable" in w for w in warns), warns
+assert any("never offered" in w for w in warns), warns
+print("warnings ok")
+
+# 8) bindings
+STORY_B = copy.deepcopy(STORY_OK)
+assert story.check_bindings(STORY_B, ["O", "Wide"], ["A"], ["Wide"]) == []
+errs = story.check_bindings(STORY_B, ["Wide"], ["A"], ["Wide"])
+assert errs == ["set 'a' anim 3: object 'O' is not in the scene"], errs
+errs = story.check_bindings(STORY_B, ["O", "Wide"], [], ["Wide"])
+assert errs == ["set 'a' anim 3: action 'A' does not exist"], errs
+errs = story.check_bindings(STORY_B, ["O", "Wide"], ["A"], [])
+assert errs == ["set 'a' anim 2: shot 'Wide' is not a camera in the scene"]
+print("bindings ok")
+
+# 9) multi-file loading incl. ./subtitles + ./audio
+FIX = tempfile.mkdtemp(prefix="twstory2")
+os.makedirs(os.path.join(FIX, "subtitles"))
+os.makedirs(os.path.join(FIX, "audio"))
+open(os.path.join(FIX, "a.srt"), "w").write(
+    "1\n00:00:00,000 --> 00:00:01,000\nHi.\n\n"
+    "2\n00:00:01,000 --> 00:00:02,000\n[CAM C]\nYo.\n")
+open(os.path.join(FIX, "subtitles", "b.srt"), "w").write(
+    "1\n00:00:00,000 --> 00:00:01,000\nBee.\n")
+open(os.path.join(FIX, "audio", "x.ogg"), "wb").write(b"RIFF....")
+YML = ("start: a\ncps: 10\nsets:\n"
+       "  a:\n    anims:\n      - subs: a.srt#1\n      - camera: Wide\n"
+       "      - action: O@A\n      - audio: x.ogg\n    end: choice pick\n"
+       "  b:\n    anims:\n      - subs: b.srt#1\n    end: stop\n"
+       "choices:\n  pick:\n    prompt: a.srt#2\n    options:\n"
+       "      - [1, Go, b]\n")
+yp = os.path.join(FIX, "story.yml")
+open(yp, "w").write(YML)
+loaded = story.load_story_files(yp)
+assert loaded["errors"] == [] and loaded["warnings"] == [], loaded
+assert sorted(loaded["files"]) == ["a.srt", "b.srt"]
+assert loaded["files"]["b.srt"]["path"].endswith(
+    os.path.join("subtitles", "b.srt"))
+assert loaded["audio"] == {"x.ogg": os.path.join(FIX, "audio", "x.ogg")}
+assert loaded["files"]["a.srt"]["cams"] == [[1.0, "C", 2]]
+open(yp, "w").write(YML.replace("b.srt#1", "nope.srt#1"))
+assert any("not found" in e
+           for e in story.load_story_files(yp)["errors"])
+open(yp, "w").write(YML.replace("x.ogg", "nope.ogg"))
+assert any("audio file" in e
+           for e in story.load_story_files(yp)["errors"])
+open(yp, "w").write("sets: [oops\n")
+assert any("story.yml" in e
+           for e in story.load_story_files(yp)["errors"])
+assert "cannot read" in story.load_story_files(
+    os.path.join(FIX, "nope.yml"))["errors"][0]
+shutil.rmtree(FIX, ignore_errors=True)
+print("loading ok")
+
+# 10) plans on the starter story
 loaded = story.load_story_files(os.path.join(HERE, "story.yml"))
 assert loaded["errors"] == [] and loaded["warnings"] == [], loaded
-assert len(loaded["cues"]) == 15 and len(loaded["cams"]) == 10, \
-    (len(loaded["cues"]), len(loaded["cams"]))
-spans = story.cam_spans(loaded["cams"], 24, 1, 708)
-assert spans == [(1, 90, "Wide"), (91, 135, "Cuby"), (136, 180, "Sphero"),
-                 (181, 225, "Cuby"), (226, 270, "Sphero"), (271, 315, "Cuby"),
-                 (316, 408, "Wide"), (409, 552, "Cuby"), (553, 708, "Sphero")], spans
-assert story.cam_spans([], 24, 1, 100) == [(1, 100, "Wide")]
-assert story.cam_spans([[0, "Wide"], [0, "Cuby"]], 24, 1, 50) == [(1, 50, "Cuby")]
-print("cam spans ok")
+assert sorted(loaded["files"]) == ["cuby.srt", "dialogue.srt", "sphero.srt"]
+assert len(loaded["files"]["dialogue.srt"]["cues"]) == 9
+story_v2, files_v2 = loaded["story"], loaded["files"]
+plan = story.set_plan(story_v2, files_v2, "main")
+assert len(plan["subs"]) == 8 and plan["dur"] == 15.0, plan["dur"]
+assert plan["end"] == ("choice", "pick")
+assert plan["prompt"] == "Who gets the last word?", repr(plan["prompt"])
+assert plan["shots"] == [(0.0, "Wide"), (0.0, "Wide"), (3.75, "Cuby"),
+                         (5.625, "Sphero"), (7.5, "Cuby"), (9.375, "Sphero"),
+                         (11.25, "Cuby"), (13.125, "Wide")], plan["shots"]
+assert len(plan["actions"]) == 6 and plan["audios"] == []
+plan_c = story.set_plan(story_v2, files_v2, "cuby")
+assert plan_c["dur"] == 3.75 and plan_c["end"] == ("choice", "pick2")
+assert plan_c["prompt"] == "CUBY: Stay square,\nfriend!"
+assert plan_c["shots"] == [(0.0, "Cuby"), (0.0, "Cuby")]
+ranged = story.set_plan(story_v2, files_v2, "main",
+                        {"main__cuby": [1, 361]})
+assert story.set_duration(ranged) == 15.0  # (361-1)/24 = 15.0
+ranged2 = story.set_plan(story_v2, files_v2, "sphero",
+                         {"sphero__sphero": [1, 241]})
+assert story.set_duration(ranged2) == 10.0, story.set_duration(ranged2)
+print("plans ok")
 
-# 8) menu body (+ driver format parity) and markers
-opts = [[1, "Ask Cuby about cubes", "cuby"],
-        [2, "Ask Sphero about spheres", "sphero"]]
-assert story.menu_body(opts) == "> 1: Ask Cuby about cubes\n  2: Ask Sphero about spheres"
-assert story.menu_body(opts) == gs._menu_body([tuple(o) for o in opts], 0)
-assert story.marker_frames(loaded["story"], loaded["cues"], 24, 1) == \
-    {"SET-main": 1, "SET-cuby": 409, "SET-sphero": 553, "CH-pick": 361}
-print("menu + markers ok")
+# 11) sidecar + schema paths/builders
+assert story.sync_path_for("/x/story.yml") == "/x/story.sync.json"
+assert story.schema_path_for("/x/story.yml") == "/x/story.schema.json"
+assert story.load_sidecar("/nonexistent.json") == {"uids": {}, "actions": {}}
+tmp = tempfile.mkdtemp(prefix="twsync")
+sp = os.path.join(tmp, "s.sync.json")
+open(sp, "w").write('{"uids": {"u": {"name": "O", "type": "MESH"}}, '
+                     '"actions": {"A": [1, 48], "bad": [1]}}')
+assert story.load_sidecar(sp) == {
+    "uids": {"u": {"name": "O", "type": "MESH"}}, "actions": {"A": [1, 48]}}
+open(sp, "w").write("not json")
+assert story.load_sidecar(sp) == {"uids": {}, "actions": {}}
+shutil.rmtree(tmp, ignore_errors=True)
+sch = story.build_schema(story_v2, ["CubyRoot", "Wide"], ["main__cuby"],
+                         ["Wide", "Cuby"], ["dialogue.srt"], ["x.ogg"])
+assert sch["properties"]["start"]["enum"] == ["cuby", "main", "sphero"]
+cam = sch["properties"]["sets"]["patternProperties"]["^.+$"][
+    "properties"]["anims"]["items"]["anyOf"][1]["properties"]["camera"]
+assert cam["enum"] == ["Cuby", "Wide"]
+opts = sch["properties"]["choices"]["patternProperties"]["^.+$"][
+    "properties"]["options"]["items"]
+assert opts["prefixItems"][2]["enum"] == ["cuby", "main", "sphero"]
+json.dumps(sch)
+print("sync/schema ok")
 
-# 9) ordered cues
-ordc = story.ordered_cues(loaded["cues"])
-assert len(ordc) == 15 and ordc[0][0] == 1 and ordc[-1][0] == 15
-assert ordc[0][3].startswith("CUBY: Hey!") and ordc[0][4] == ["CUBY"]
-assert ordc[8][0] == 9 and ordc[8][4] == []  # prompt is narration
-print("ordered cues ok")
+# 12) menu body
+assert story.menu_body([[1, "A", "x"], [2, "B", "y"]]) == "> 1: A\n  2: B"
+print("menu ok")
 
-# 10) full starter validation incl. timeline fit
-assert story.validate_story(loaded["story"], loaded["cues"], 1, 708) == []
-assert story.load_story_files(os.path.join(HERE, "story.yml"),
-                              1, 708)["errors"] == []
-missing = story.load_story_files(os.path.join(HERE, "nope.yml"))
-assert missing["errors"] and "cannot read" in missing["errors"][0]
-print("starter story ok")
-
-# 11) driver parser parity on real + tricky input
-tyml = open(os.path.join(HERE, "story.yml")).read()
-tsrt = open(os.path.join(HERE, "dialogue.srt")).read()
-assert gs.parse_minimal_yaml(tyml) == story.parse_minimal_yaml(tyml)
-assert gs.parse_srt_simple(tsrt) == story.parse_srt_simple(tsrt)
-tricky = ('# c\ntop:\n  flow: [1, "a,b", it\'s, -2.5, [x, []]]\n'
-          '  q: "A\\"B\\\\C\\nD"\n  s: don\'t # tail\n  e: []\nlist:\n  - 1\n  - [2, three]\n')
-assert gs.parse_minimal_yaml(tricky) == story.parse_minimal_yaml(tricky)
-tsrt2 = ("7\n00:00:01,000 --> 00:00:02,000\n[CAM Wide]\n[END]\nX [Y] Z.\n\n"
-         "00:00:03,500 --> 00:00:04,000\nSecond.\n")
-assert gs.parse_srt_simple(tsrt2) == story.parse_srt_simple(tsrt2)
-print("driver parity ok")
-
-# 12) add-on strip parity (AST extract, no bpy import)
+# 13) add-on strip parity (AST extract, no bpy import)
 addon_src = open(os.path.join(HERE, "typewriter_subtitles.py")).read()
 tree = ast.parse(addon_src)
 fn_node = None
