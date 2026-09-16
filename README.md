@@ -20,10 +20,14 @@ timeline everything else is measured against.
   baked per-cue text objects. The shot cuts and the rest of the story are the
   game's business (press **P**) — see [the authoring
   model](#the-authoring-model-one-scene-one-set-at-a-time).
-- `test/` — stills: `v2_main_*.png` (typing proofs from the animation render),
-  `v2_noaddon_0030.png` vs `v2_addon_0030.png` (full-line card without the
-  add-on, live typing with it), `v2_menu_*.png` (a previewed set's choice
-  menu), `v2_cuby_*.png` / `v2_sphero_*.png` (the other two sets previewed).
+- `test/` stills (all from this repo's scene, rendered headless):
+  `v2_main_0030/0200/0361.png` — the `main` set typing; `0361` is the set's
+  last frame, where the armed choice menu is revealed.
+  `v2_noaddon_0008.png` vs `v2_addon_0008.png` — the same frame with and
+  without the add-on: a full-line card vs a live `CUBY: He…` reveal.
+  `v2_cuby_0030.png` / `v2_sphero_0030.png` — the *other* two sets after
+  **Preview Set** (their cues are not baked, so these prove the live-typing
+  path plus the per-set action swap).
 
 ## Play it
 
@@ -125,7 +129,7 @@ with any selection (or none):
 | Control | What it does |
 |---|---|
 | `Story File` | Which `story.yml` the tools read (default `//story.yml`, next to the .blend). The game reads its own path from the `tw_story` game property; this one is for the editor. |
-| **Preview `main` / `cuby` / …** | The per-set context switch: that set's cues become the subtitle lines (set-local frames), its `action:` animations get assigned to the actors (action + slot), the render camera snaps to its opening staged shot (lens included), its `end: choice` fills the menu, its audio becomes sequencer sound strips, and the frame range becomes the set's length. It only ever *assigns* — no action, key or line of another set is deleted. |
+| **Preview `main` / `cuby` / …** | The per-set context switch: that set's cues become the subtitle lines (set-local frames), its `action:` animations get assigned to the actors (action + slot), the render camera snaps to its opening staged shot (lens included), its `end: choice` arms the menu (revealed only over the set's tail), its audio becomes sequencer sound strips, and the frame range becomes the set's length. Other sets' baked `<set>_Line##` objects get hidden (bakes are set-local, so they would stack on top of each other), and live typing mirrors the bake: a baked set lets its baked objects carry the text, an unbaked set types live. It only ever *assigns* or *hides* — no action, key or line of another set is deleted. |
 | **Refresh Sync** | Writes `story.sync.json` (every action's keyframe range + the uid map the rename watch needs) and `story.schema.json` (VSCode completion for `story.yml`), and sets a fake user on the story's actions so a purge can't eat them. **Also runs automatically on save**, so the sidecar can never drift from your keys. |
 | **Check** | Validates `story.yml` + every `.srt` it references and cross-checks the object/action/camera names against this scene. Results are plain text lines in the box (no graph UI — that was a deliberate veto). |
 | **Apply to Story** | When you rename a referenced object/action/camera, the panel lists the pending renames; Apply rewrites them **only where they are used as references** (`Obj@Act`, `camera: Shot`, `[CAM Shot]` in the `.srt` files) — labels, set names and prose are untouched, and the write is atomic. `Auto-rewrite refs on rename` applies them the moment they are detected instead. |
@@ -159,7 +163,7 @@ that job (and much more).
 | `tw_game.py` / `test_tw_game.py` | Generic driver for projects *without* a story (embedded by Add Game Logic) + its test |
 | `build_scene.py` | Builds/refreshes the .blend headless (additive: create-if-missing, never deletes keys) |
 | `resave_game.py` | Refreshes the demo's game setup + self-tests the generic path (Xvfb) |
-| `verify_game.py` | Headless wiring check of the .blend (82 checks; never saves) |
+| `verify_game.py` | Headless wiring check of the .blend (86 checks; never saves) |
 | `register_addon.py` | Registers the add-on for background renders |
 | `set_capture.py`, `autostart_game.py` | Make a `*_capture.blend` that auto-records the game |
 | `test_story.py` | Story/YAML/SRT parsing, plans, sidecar/schema, rewrite, add-on parity |
@@ -210,6 +214,20 @@ blenderplayer -w 640 360 talking_robots_capture.blend   # → capture/game_*.png
 
 ## Notes & troubleshooting
 
+- **The choice menu is state-driven, never keyframed.** The preview stores the
+  option list on the menu object (invisible `_tw_menu_choice`) and the frame
+  handler reveals it only over the last quarter-second of a set that ends in a
+  choice — so scrubbing the middle of a set shows no overlay, and frame
+  `frame_end` shows exactly what the player will see when the set stops. A set
+  ending in `stop` disarms it. If the menu ever carries its own action, the
+  add-on steps aside (hand-authored keys always win), and the game writes the
+  text per tick anyway.
+- **Subtitles sit just in front of the camera, not in the scene.** The live
+  text and the menu are parented to the render camera at 0.45 units with a
+  small size (0.015 / 0.009) — the same apparent size as a 3 m plate with
+  0.10 text, but never occluded: at 3 m a close-up put the robot's face in
+  front of the line. They stay real 3D geometry (materials, extrude, bevel,
+  renderable, scrubbable).
 - **The camera is procedural, not baked.** `Wide` / `Cuby` / `Sphero` are real
   camera objects carrying the framing *and the lens* (50/55/45 mm). The game
   smoothsteps + slerps the single render camera between them and follows the

@@ -156,6 +156,19 @@ def main():
         check(menu.animation_data is None
               or menu.animation_data.action is None,
               "menu is plain (state-driven, no keys)")
+        armed = str(menu.get("_tw_menu_choice", "") or "")
+        check(bool(armed) == (plan["end"][0] == "choice"),
+              "menu armed with the previewed set's options",
+              repr(armed.splitlines()[:1]))
+        scene.frame_set(int(scene.frame_end))
+        tw_moved = mod._menu_tick(scene)
+        check(bool(menu.data.body) and float(menu.scale[0]) > 0.5,
+              "menu reveals at the choice tail", repr(menu.data.body))
+        scene.frame_set(int(scene.frame_start))
+        mod._menu_tick(scene)
+        check(menu.data.body == "" and float(menu.scale[0]) < 1e-6,
+              "menu hides mid-set (no always-on overlay)",
+              "%r%s" % (menu.data.body, " (moved)" if tw_moved else ""))
 
     # --- game bricks + embedded driver ------------------------------------
     gd = bpy.data.objects.get("GameDirector")

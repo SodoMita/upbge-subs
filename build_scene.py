@@ -41,6 +41,16 @@ SHOTS = {
     "Sphero": ((1.9, -3.1, 1.9), (1.25, 0, 1.15), 45.0),
 }
 
+# Subtitles + menu are real 3D geometry parented to the render camera, so they
+# must sit just IN FRONT of the camera plane (0.45 units, tiny) rather than
+# deep in the scene: a plate 3 m out hides behind a robot in a close-up.
+# Apparent size is unchanged (size / distance is what the eye sees).
+SUB_DIST = 0.45
+SUB_LOCAL = (0.0, -0.066, -SUB_DIST)
+SUB_SIZE = 0.015
+MENU_LOCAL = (0.0, 0.045, -SUB_DIST)
+MENU_SIZE = 0.009
+
 # Rest poses the per-set actions start and end on (the actors' own defaults).
 RIG_REST = {
     "CubyRoot":   {"kind": "root", "who": "CUBY",
@@ -603,8 +613,8 @@ def build_text_objects(cam, mats, story):
             pass
     sub.data.align_x = 'CENTER'
     sub.data.align_y = 'CENTER'
-    sub.data.size = 0.10
-    for attr, val in (("extrude", 0.008), ("bevel_depth", 0.0015),
+    sub.data.size = SUB_SIZE
+    for attr, val in (("extrude", 0.0012), ("bevel_depth", 0.0002),
                       ("resolution_u", 3)):
         try:
             setattr(sub.data, attr, val)
@@ -613,15 +623,17 @@ def build_text_objects(cam, mats, story):
     if not sub.data.materials:
         sub.data.materials.append(mats['subtitle'])
     sub.parent = cam
-    sub.location = (0, -0.44, -3.0)
+    sub.location = SUB_LOCAL
     sub.tw_enabled = True
     sub.tw_cps = cps
     sub.tw_reveal = 'LINEAR'
     menu = bpy.data.objects.get("ChoiceMenu")
     if menu is None:
-        menu = add_text("ChoiceMenu", "", size=0.06)
+        menu = add_text("ChoiceMenu", "", size=MENU_SIZE)
+    else:
+        menu.data.size = MENU_SIZE
     menu.parent = cam
-    menu.location = (0, 0.30, -3.0)
+    menu.location = MENU_LOCAL
     if not menu.data.materials:
         menu.data.materials.append(mats['menu'])
     # NO scale/visibility keys: the menu is a plain object the driver shows

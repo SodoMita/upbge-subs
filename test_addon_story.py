@@ -136,7 +136,10 @@ assert sub.tw_entries[0].text == "ACTOR: first line"
 assert int(scene.frame_end) == 49, [m for m in msgs]
 assert scene.tw_preview_set == "main"
 assert actor.animation_data.action is act
-assert menu.data.body == "> 1: Go to cuby", repr(menu.data.body)
+# the menu is state-driven: armed for the set, but only revealed at its tail
+assert str(menu.get("_tw_menu_choice", "")) == "> 1: Go to cuby", \
+    repr(menu.get("_tw_menu_choice"))
+assert menu.data.body == "", "hidden mid-set: " + repr(menu.data.body)
 assert tuple(cam.location) == tuple(bpy.data.objects["Wide"].location)
 assert cam.data.lens == 50.0
 scene.frame_set(25)                       # cue 2 starts here: 0 chars yet
@@ -157,6 +160,7 @@ log("preview main: %d lines, end=%d, live typing f27=%r f40=%r"
 ok, msgs = tw.preview_set_impl(scene, "cuby")
 assert ok, msgs
 assert len(sub.tw_entries) == 1 and int(scene.frame_end) == 25, msgs
+assert str(menu.get("_tw_menu_choice", "")) == "", "set ends in stop"
 assert menu.data.body == "", repr(menu.data.body)
 assert cam.data.lens == 65.0, cam.data.lens       # snapped to Close
 log("preview cuby: end=%d lens=%s" % (scene.frame_end, cam.data.lens))
@@ -239,10 +243,43 @@ items = tw._preview_set_items(None, bpy.context)
 assert [i[1] for i in items] == ["cuby", "main (start)"], items
 assert tw._SET_PICK["s1"] == "main" and tw._SET_PICK["s0"] == "cuby", \
     tw._SET_PICK
+assert sub.tw_enabled is False, "the bake above turned live typing off"
 assert bpy.ops.tw.preview_set(set_id="s0") == {'FINISHED'}     # preview cuby
 assert scene.tw_preview_set == "cuby"
-assert len(sub.tw_entries) == 1, len(sub.tw_entries)
+assert sub.tw_enabled is True, "preview re-enables typing for an unbaked set"
+assert len(sub.tw_entries) == 1, len(sub.tw_entries)   # cuby has one cue
+_b = bpy.data.objects["main_Line01"]
+_b.hide_viewport = _b.hide_render = False          # pretend it is visible
+ok, msgs = tw.preview_set_impl(scene, "cuby")
+assert _b.hide_render and _b.hide_viewport, "other set's bake must hide"
+assert not any(o.hide_render for o in bpy.data.objects
+               if o.name.startswith("cuby_Line")), "own bake stays visible"
+ok, msgs = tw.preview_set_impl(scene, "main")      # main IS baked
+assert sub.tw_enabled is False, "baked set: no double text"
+assert not _b.hide_render, "previewed set's bake is shown again"
+assert len(sub.tw_entries) == 2, len(sub.tw_entries)   # back to main's cues
+log("bake visibility: per set, no stacked text")
 
+
+# --- 9b) the choice menu is state-driven, not always-on -------------------
+ok, _m = tw.preview_set_impl(scene, "main")
+assert ok
+scene.frame_set(10)
+tw._menu_tick(scene)
+assert menu.data.body == "" and abs(float(menu.scale[0])) < 1e-6, (
+    menu.data.body, tuple(menu.scale))          # hidden mid-set
+scene.frame_set(int(scene.frame_end))
+bpy.context.view_layer.update()
+tw._menu_tick(scene)
+assert menu.data.body == "> 1: Go to cuby", repr(menu.data.body)
+assert float(menu.scale[0]) > 0.5, tuple(menu.scale)   # revealed at the tail
+ok, _m = tw.preview_set_impl(scene, "cuby")       # ends in `stop`: no menu
+scene.frame_set(int(scene.frame_end))
+tw._menu_tick(scene)
+assert menu.data.body == "" and float(menu.scale[0]) < 1e-6, \
+    repr(menu.data.body)
+log("menu: a set ending in stop never reveals it")
+log("menu: hidden mid-set, revealed at the choice tail")
 
 class _FakeLayout:                          # records calls, never draws
     def __init__(self, log=None):

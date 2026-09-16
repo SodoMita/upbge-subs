@@ -2255,8 +2255,17 @@ def sync_speakers(scene, loaded, plan, fps, frame_start, set_name):
     return "%d sound strip(s)" % made if made else ""
 
 
+MENU_LEAD = 0.25         # seconds of tail where the menu is visible
+
+
 def menu_preview(scene, plan, story):
-    """Choice menu text for the previewed set ('' when it has no choice)."""
+    """Arm the choice menu for the previewed set ('' when it has no choice).
+
+    The menu stays a plain, key-free object: the story's rule is that the
+    *state* shows it (the game writes its text per tick), so the editor does
+    the same - `_menu_tick` reveals it only over the tail of a set that ends
+    in a choice. Nothing here writes animation data.
+    """
     menu = bpy.data.objects.get("ChoiceMenu")
     if menu is None or menu.type != 'FONT':
         return "no ChoiceMenu text object"
@@ -2267,11 +2276,46 @@ def menu_preview(scene, plan, story):
         opts = [list(o) for o in ch.get("options", []) or []]
         body = menu_body_for(opts)
     try:
-        menu.data.body = body
-        menu.scale = (1.0, 1.0, 1.0)
+        menu["_tw_menu_choice"] = body
     except Exception as ex:
-        return "menu write failed: %r" % (ex,)
+        return "menu arm failed: %r" % (ex,)
+    _menu_tick(scene)
     return ""
+
+
+def _menu_tick(scene):
+    """Show ChoiceMenu only at the end of a set that ends in a choice.
+
+    Skipped when the menu carries its own action (hand-authored keys always
+    win) and in the game (handlers do not run there). Returns True when it
+    changed something, so callers can avoid needless redraws.
+    """
+    if scene is None:
+        return False
+    menu = scene.objects.get("ChoiceMenu") if hasattr(scene, "objects") \
+        else None
+    if menu is None or menu.type != 'FONT':
+        return False
+    ad = menu.animation_data
+    if ad is not None and ad.action is not None:
+        return False
+    body = str(menu.get("_tw_menu_choice", "") or "")
+    try:
+        lead = max(2, int(round(scene_fps(scene) * MENU_LEAD)))
+        show = (bool(body)
+                and int(scene.frame_current) >= int(scene.frame_end) - lead)
+    except Exception:
+        return False
+    want = body if show else ""
+    changed = False
+    if menu.data.body != want:
+        menu.data.body = want
+        changed = True
+    s = 1.0 if show else 0.0
+    if max(abs(float(menu.scale[i]) - s) for i in range(3)) > 1e-6:
+        menu.scale = (s, s, s)
+        changed = True
+    return changed
 
 
 def menu_body_for(options):
@@ -2530,6 +2574,25 @@ def preview_set_impl(scene, set_name, jump=True):
     if sub is not None and sub.type == 'FONT':
         n = set_entries_from_plan(sub, scene, plan, fps, f0)
         msgs.append("%d subtitle line(s) on '%s'" % (n, sub.name))
+        baked_here = [o for o in scene.objects
+                      if o.name.startswith("%s_Line" % set_name)]
+        if baked_here:
+            # The set is baked, so its per-cue objects are the ones that show
+            # (and type, while the add-on runs). Leaving the source enabled as
+            # well would draw the same line twice, so this mirrors the bake:
+            # baked set -> live typing off, unbaked set -> on.
+            if sub.tw_enabled:
+                sub.tw_enabled = False
+            msgs.append("%d baked line(s) for this set carry the text - live "
+                        "typing off (Bake to Objects refreshes them)"
+                        % len(baked_here))
+        elif not sub.tw_enabled:
+            # Bake to Objects turns live typing off on its source; a preview
+            # of an unbaked set must turn it back on or the cues you just
+            # loaded would never show up.
+            sub.tw_enabled = True
+            msgs.append("live typing re-enabled on '%s' (a bake had it off)"
+                        % sub.name)
         try:            # the story's cps is the authoritative typing speed
             want_cps = float(story.get("cps", 0) or 0)
             if want_cps > 0 and abs(float(sub.tw_cps) - want_cps) > 1e-3:
@@ -2562,6 +2625,10 @@ def preview_set_impl(scene, set_name, jump=True):
     guarded = fake_user_guard(lib, story)
     if guarded:
         msgs.append("fake user set on %d action(s)" % guarded)
+    shown = sync_bake_visibility(scene, set_name, sorted(sets))
+    if shown:
+        msgs.append("%d baked line(s) of other sets hidden (frames overlap)"
+                    % shown)
     try:
         if int(scene.frame_end) != want_end:
             scene.frame_end = want_end
@@ -2579,6 +2646,30 @@ def preview_set_impl(scene, set_name, jump=True):
         pass
     _redraw_panels()
     return True, msgs
+
+
+def sync_bake_visibility(scene, set_name, set_names):
+    """Keep only the previewed set's baked lines visible (viewport+render).
+
+    Baked lines are set-local, so every set's bake occupies the same frames:
+    showing two at once would stack their text. Only objects this feature
+    created are touched - `<name>_Line##` where <name> is a set of this
+    story - so hand-named text is never hidden. (Game-wise this is inert:
+    the driver hides every `_Line` object anyway and types into the live one.)
+    """
+    n = 0
+    for o in scene.objects:
+        if o.type != 'FONT':
+            continue
+        base, sep, tail = o.name.partition("_Line")
+        if not sep or base not in set_names or not tail.isdigit():
+            continue
+        want_hide = (base != set_name)
+        if o.hide_render != want_hide or o.hide_viewport != want_hide:
+            o.hide_render = want_hide
+            o.hide_viewport = want_hide
+            n += 1
+    return n
 
 
 def _preview_target(scene):
@@ -3144,6 +3235,7 @@ def tw_frame_change(scene, depsgraph=None):
     dragging = _modal_active()
     _IN_HANDLER = True
     try:
+        _menu_tick(scene)
         for obj in scene.objects:
             if obj.type == 'FONT' and (len(obj.tw_entries) or obj.tw_auto_reload):
                 try:
@@ -3175,6 +3267,7 @@ def tw_depsgraph_update(scene, depsgraph):
     dragging = _modal_active()
     _IN_HANDLER = True
     try:
+        _menu_tick(scene)
         for obj in scene.objects:
             if obj.type != 'FONT' or not (len(obj.tw_entries) or obj.tw_auto_reload):
                 continue
@@ -3259,6 +3352,7 @@ def tw_load_post_story(*args):
         return
     _NAME_SNAPSHOT.clear()
     try:
+        _menu_tick(scene)
         story_check_impl(scene)
         name_watch_scan(scene, force=True)
     except Exception:

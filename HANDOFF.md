@@ -30,7 +30,13 @@ pipeline. All five queued items from the last handoff are done:
    **Refresh Sync** (`story.sync.json` + `story.schema.json`, also on save via
    `write_sync_files`, which stamps nothing so the file stays clean);
    validator text lists in the panel (no graph, per the veto); Bake to Objects
-   per set (`<set>_Line##`); `Jump to Set` removed (Preview Set replaced it).
+   per set (`<set>_Line##`); `sync_bake_visibility` hides other sets' bakes
+   during a preview (set-local frames would stack) and live typing mirrors the
+   bake (baked set -> its baked objects carry the text, unbaked set -> live
+   typing on); `Jump to Set` removed (Preview Set replaced it).
+   Subtitle/menu plates hang 0.45 m in front of the camera (small size, same
+   apparent size) so close-ups can't occlude them - `SUB_LOCAL`/`MENU_LOCAL`
+   in build_scene.py; a 3 m plate put the robots' faces in front of the line.
    Kept: entries/keys/live typing, import/export, save_pre/post,
    `setup_game_logic`, `_is_directive_line`, `TW_GAME_DRIVER_SOURCE` (tests
    pin the last two via AST/extract). Story `cps` is applied to the previewed
@@ -45,7 +51,7 @@ pipeline. All five queued items from the last handoff are done:
 3. **resave_game.py v2** — v2 story validation + `check_bindings` before it
    saves, sidecar refresh, generic-path self-test, keeps the no-`Text`-write
    rule.
-4. **verify_game.py v2** — **82 checks, 0 failures** on the shipped .blend
+4. **verify_game.py v2** — **86 checks, 0 failures** on the shipped .blend
    (story clean, sidecar present + ranges == live keys, uids cover every
    reference, bindings vs scene, per-set fake users, frame range = start set,
    no markers, camera unbaked, baked `<set>_Line##` per previewed set, menu
@@ -79,6 +85,9 @@ rename→`[CAM]` in .srt, refuses to rewrite a broken story),
 - v1's eye-blink/master-timeline charm: blink keys are not part of any set
   action (`story.yml` has no eye actor). Adding one means a new `action:`
   line — which changes `plan["actions"]` counts that `test_story.py` pins.
+- `test/` holds only v2 stills now (v1's `br_*`/`fx_*`/`st_*`/`v8*`/`test_*`
+  frames were deleted: they showed the removed marker / baked-camera
+  pipeline). Re-render them only as v2 frames.
 - The old `talking_robots_timeline.mp4` (v1, push-in + cuts) was replaced by a
   start-set-only render; a "whole story" video needs the game capture, not the
   timeline.
@@ -190,7 +199,13 @@ import typewriter_subtitles as tw; tw.register()
     `KX_FontObject.text` + `["Text"]` both writable in-game (KX path safe).
 17. `test*.py` run order-independent; `game_debug.log` is written next to the
     story in tests — integration cleans `HERE/game_debug.log`, keep that.
-18. `Scene.tw_uid_seq` (int ID property) is the uid counter; `name_watch_scan`
+18. The ChoiceMenu is **not** shown by writing its body at preview time — the
+    first v2 render had the menu on every frame because of that. `menu_preview`
+    only arms `menu["_tw_menu_choice"]`; `_menu_tick()` (called from the frame +
+    depsgraph handlers and on load) decides visibility: shown when
+    `frame >= scene.frame_end - max(2, round(fps*MENU_LEAD))` and the armed text
+    is non-empty, hidden otherwise, and never when the menu has its own action.
+19. `Scene.tw_uid_seq` (int ID property) is the uid counter; `name_watch_scan`
     skips automatic work when `bpy.app.background` (so headless builds stay
     deterministic) unless called with `force=True` — that is how
     `test_addon_story.py` drives the watcher.
