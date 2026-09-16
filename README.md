@@ -54,8 +54,13 @@ timeline everything else is measured against.
    camera between the staged shot cameras, types the lines. **Up/Down +
    Enter** (or **1**/**2**) picks a choice, **R** restarts, **ESC** quits.
    `game_debug.log` next to the .blend records sets, choices and actors, so
-   you can prove the logic ran. The sandbox this was built in has no GPU, so
-   the game was verified by unit tests + wiring checks, not by a live run.
+   you can prove the logic ran. The sandbox this was built in has no GPU,
+   and the game has since been **run live** on a pure-software stack —
+   sway headless + pixman renderer, Xwayland, llvmpipe
+   (`tools/run_sway_capture.sh`): full story loop with logged auto-picks,
+   screenshots every stride, and the auto-quit backstop. Frames from one
+   such run: `docs/game_live_0150.png` (wide) and `docs/game_live_0450.png`
+   (the game's own staged-shot cut).
 
 ## The authoring model: one scene, one set at a time
 
@@ -201,7 +206,11 @@ bakes it headless - deterministic, no display, no rasterizer. The live
 smoke run proves the *story* drives correctly in the real player; on
 GPU-less boxes the player's first-frame catch-up bursts make in-game
 trajectories unreliable, which is exactly why the physics assertions
-live in the bake (see HANDOFF.md, "Software-GL physics notes").
+live in the bake (see HANDOFF.md, "Software-GL physics notes"). Live
+captures from that software-GL run (320×180 player window):
+`docs/newton_live_010.png` / `newton_live_040.png` / `newton_live_088.png`
+- bodies at trigger, mid-flight and at rest; the `watch` lines in
+`game_debug.log` carry the exact positions.
 
 Rebuild pipeline:
 

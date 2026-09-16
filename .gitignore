@@ -8,3 +8,4 @@ capture/
 *.sync.json.tmp
 *.yml.tmp
 *_capture.blend
+live_newton.log

@@ -140,6 +140,12 @@ against `persist_A.blend` — it needs the `SubTest` object that mode A creates)
 and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified).
 `make_stills.py` reproduces all 9 committed stills byte-for-byte in IDAT terms
 (pixel-identical); re-running it is the media regression check.
+Re-verified on `agent/newton-mechanics` (2026-09-16, this box): all four
+stdlib suites + `test_addon_story` + persistence A/B/C/R + `test_load_repair`
++ `test_ops` + `test_panel_draw` green, `verify_game.py` 117 ok / 0 failed,
+and the Newton physics bake prints all three laws with the documented
+numbers. Live captures committed as `docs/game_live_0150.png` /
+`game_live_0450.png` (talking robots) and `docs/newton_live_*.png` (Newton).
 
 ## Still open / known gaps (pick from here)
 
@@ -161,7 +167,40 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
   `CAPTURE_STRIDE` (screenshot every Nth tick; 60 Hz stories burn the
   ~900-capture budget at stride 2) and `CAPTURE_TICRATE` (slow logic
   clock for bounded trajectories on software GL). A talking-robots
-  capture pass with the v2 story is still owed on a faster machine.
+  capture pass with the v2 story: **DONE** (agent/newton-mechanics,
+  2026-09-16) - `blenderplayer` on the self-contained sway+pixman stack
+  played the whole loop (main -> choice 'pick' auto-pick -> cuby ->
+  choice 'pick2' auto-pick -> main), wrote 888 captures, hit the
+  1800-tick backstop ("capture budget hit, quitting") and exited
+  cleanly in ~1 min on a 2 vCPU box (UI path: 472 captures, ~3.5 min).
+  **Root cause of the old capture bug (agent probe, 2026-09-16):** the
+  previous `set_capture.py` set `d["CAPTURE"] = 1` — a *custom (id)
+  property*. In game mode UPBGE 0.50 does not expose the .blend's custom
+  properties on game objects at all (probe scene: `p_str`/`p_int`/
+  `p_float`/`CAPTURE` all raise `KeyError`; game properties are visible —
+  the driver reads `tw_story` that way). So capture mode never armed: no
+  screenshots, no auto-pick, no backstop, and the run looped the first
+  choice forever. `set_capture.py` now creates `CAPTURE` as a *game*
+  property (and takes any scene that has a GameDirector).
+- **Self-contained sway + pixman stack** (agent, 2026-09-16):
+  `tools/run_sway_capture.sh <blend>` brings up the whole display
+  software-free — sway with `WLR_BACKENDS=headless WLR_RENDERERS=pixman`,
+  Xwayland :1 (the engine's GHOST is X11-only in 0.50: it tries
+  back-end(s) `['X11']` and nothing else, and there is **no `--game`
+  CLI flag** — `--game` is parsed as a filename; use `blenderplayer` or
+  editor + `autostart_game.py`), llvmpipe for the game GL, and
+  optionally a PulseAudio null sink (`WITH_PULSE=1`) which is a verified
+  alternative to the audio patch for the unpatched binary (full
+  talking-robots story ran on the unpatched UI path with a null sink:
+  actors moved — `playAction` by name works with multi-action objects,
+  so no fallback is needed — choices auto-picked, 1800-tick backstop
+  fired, process exited on its own). The user's own Newton harness
+  also passes on this stack (`REBUILD=1 ... sh tools/run_live_newton.sh`
+  with the stack's DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR: 5 sets, 55 watch
+  lines, 92 captures — note `newton_capture.blend` is git-ignored, so
+  `REBUILD=1` is mandatory). `install_env.sh` rebuilds packages + UPBGE
+  0.50 + swap from a bare box (system state does not survive a sandbox
+  snapshot; /opt and apt packages are wiped too).
 - **No audio content**: `./audio/` doesn't exist, so `audio:` anims and the
   speaker-strip path are only covered by the fake-`bge` tests. Blender 5 has
   no `bpy.data.sounds`/`AudioPreview`; the add-on uses
@@ -251,6 +290,12 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
 cd /home/user/talking_robots
 python3 test_story.py && python3 test_game_logic.py && python3 test_tw_game.py
 U=/home/user/upbge/upbge-0.50-linux-x64
+# --- software-GL proof stack (no GPU, no pre-existing display; Debian) ---
+sudo bash install_env.sh                        # apt + UPBGE 0.50 -> /opt + audio patch + swap
+$U/blender -b talking_robots.blend -P set_capture.py     # CAPTURE as a GAME property
+UPBGE=$U sh tools/run_sway_capture.sh talking_robots_capture.blend 420
+#   (brings up sway headless+pixman, Xwayland :1, llvmpipe; WITH_PULSE=1
+#    for unpatched binaries; evidence: game_debug.log + capture/)
 timeout 600 xvfb-run -a -s "-screen 0 1280x800x24" $U/blender --factory-startup -P build_scene.py
 timeout 300 xvfb-run -a -s "-screen 0 1280x800x24" $U/blender talking_robots.blend -P resave_game.py
 $U/blender -b talking_robots.blend -P verify_game.py
