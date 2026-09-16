@@ -161,7 +161,12 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
   `CAPTURE_STRIDE` (screenshot every Nth tick; 60 Hz stories burn the
   ~900-capture budget at stride 2) and `CAPTURE_TICRATE` (slow logic
   clock for bounded trajectories on software GL). A talking-robots
-  capture pass with the v2 story is still owed on a faster machine.
+  capture pass with the v2 story: **DONE** (agent/newton-mechanics,
+  2026-09-16) - `blenderplayer` on the self-contained sway+pixman stack
+  played the whole loop (main -> choice 'pick' auto-pick -> cuby ->
+  choice 'pick2' auto-pick -> main), wrote 888 captures, hit the
+  1800-tick backstop ("capture budget hit, quitting") and exited
+  cleanly in ~1 min on a 2 vCPU box (UI path: 472 captures, ~3.5 min).
   **Root cause of the old capture bug (agent probe, 2026-09-16):** the
   previous `set_capture.py` set `d["CAPTURE"] = 1` — a *custom (id)
   property*. In game mode UPBGE 0.50 does not expose the .blend's custom
@@ -183,9 +188,13 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
   talking-robots story ran on the unpatched UI path with a null sink:
   actors moved — `playAction` by name works with multi-action objects,
   so no fallback is needed — choices auto-picked, 1800-tick backstop
-  fired, process exited on its own). `install_env.sh` rebuilds packages
-  + UPBGE 0.50 + swap from a bare box (system state does not survive a
-  sandbox snapshot; /opt and apt packages are wiped too).
+  fired, process exited on its own). The user's own Newton harness
+  also passes on this stack (`REBUILD=1 ... sh tools/run_live_newton.sh`
+  with the stack's DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR: 5 sets, 55 watch
+  lines, 92 captures — note `newton_capture.blend` is git-ignored, so
+  `REBUILD=1` is mandatory). `install_env.sh` rebuilds packages + UPBGE
+  0.50 + swap from a bare box (system state does not survive a sandbox
+  snapshot; /opt and apt packages are wiped too).
 - **No audio content**: `./audio/` doesn't exist, so `audio:` anims and the
   speaker-strip path are only covered by the fake-`bge` tests. Blender 5 has
   no `bpy.data.sounds`/`AudioPreview`; the add-on uses

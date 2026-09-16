@@ -1,0 +1,24 @@
+GL_VENDOR: Mesa
+GL_RENDERER: llvmpipe (LLVM 19.1.7, 256 bits)
+GL_VERSION: 4.5 (Core Profile) Mesa 25.0.7-2+deb13u1
+GL_SHADING_LANGUAGE_VERSION: 4.50
+Supported Extensions...
+ GL_ARB_shader_objects supported?       yes.
+ GL_ARB_geometry_shader4 supported?     no.
+ GL_ARB_vertex_shader supported?        yes.
+ ----------Details----------
+  Max uniform components.16384
+  Max varying floats.128
+  Max vertex texture units.32
+  Max vertex attribs.16
+  Max combined texture units.192
+
+ GL_ARB_fragment_shader supported?      yes.
+ ----------Details----------
+  Max uniform components.16384
+
+ GL_ARB_texture_cube_map supported?     no.
+ GL_ARB_multitexture supported?         no.
+ GL_ARB_texture_env_combine supported?  no.
+ GL_ARB_draw_instanced supported?  yes.
+Error: totblock: 22

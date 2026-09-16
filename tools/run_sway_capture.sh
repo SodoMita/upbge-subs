@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # run_sway_capture.sh - bring up a FULL headless display stack and run a UPBGE
 # capture blend inside it. No GPU, no pre-existing display, no /run/user.
 #
@@ -28,7 +28,7 @@
 # Requires: sway wlr-randr xwayland pulseaudio libgl1-mesa-dri
 #           x11-xserver-utils          (install_env.sh installs all of it)
 set -u
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
 BLEND="${1:?usage: run_sway_capture.sh <blend> [budget-seconds]}"
 BUDGET="${2:-420}"
 UPBGE="${UPBGE:-/opt/upbge-0.50-linux-x64}"
