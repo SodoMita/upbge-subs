@@ -140,6 +140,12 @@ against `persist_A.blend` — it needs the `SubTest` object that mode A creates)
 and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified).
 `make_stills.py` reproduces all 9 committed stills byte-for-byte in IDAT terms
 (pixel-identical); re-running it is the media regression check.
+Re-verified on `agent/newton-mechanics` (2026-09-16, this box): all four
+stdlib suites + `test_addon_story` + persistence A/B/C/R + `test_load_repair`
++ `test_ops` + `test_panel_draw` green, `verify_game.py` 117 ok / 0 failed,
+and the Newton physics bake prints all three laws with the documented
+numbers. Live captures committed as `docs/game_live_0150.png` /
+`game_live_0450.png` (talking robots) and `docs/newton_live_*.png` (Newton).
 
 ## Still open / known gaps (pick from here)
 

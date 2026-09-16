@@ -58,7 +58,9 @@ timeline everything else is measured against.
    and the game has since been **run live** on a pure-software stack —
    sway headless + pixman renderer, Xwayland, llvmpipe
    (`tools/run_sway_capture.sh`): full story loop with logged auto-picks,
-   screenshots every stride, and the auto-quit backstop.
+   screenshots every stride, and the auto-quit backstop. Frames from one
+   such run: `docs/game_live_0150.png` (wide) and `docs/game_live_0450.png`
+   (the game's own staged-shot cut).
 
 ## The authoring model: one scene, one set at a time
 
