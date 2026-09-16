@@ -274,6 +274,14 @@ STILL_SET=cuby $U/blender -b talking_robots.blend -P /tmp/still.py \
     deterministic) unless called with `force=True` — that is how
     `test_addon_story.py` drives the watcher.
 
+21. `write_sync_files` (the save handler) refuses to write unless the scene
+    actually holds the story's objects: saving a scratch .blend in the same
+    folder as someone's `story.yml` used to rewrite `story.sync.json` with the
+    scratch scene's actions (`test_persistence.py` MODE=A did exactly that to
+    the repo copy once - restore with git if it ever happens again). The
+    explicit **Refresh Sync** button always writes (user intent). `test_addon_
+    story.py` section 10 pins both directions.
+
 ## Related: UPVN (github.com/SodoMita/UPVN)
 
 Ren'Py-like VN framework for UPBGE (v0.6.x, 391 files, 335 tests): direct

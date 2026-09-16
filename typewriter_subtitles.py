@@ -2731,6 +2731,17 @@ def write_sync_files(scene):
     except Exception:
         return
     try:
+        # Only for a scene that actually holds this story: saving a scratch
+        # .blend in the same folder must not rewrite the project's sidecar
+        # with that scene's actions (a test did exactly that once).
+        refs, _objs, _cams = story_refs(lib, lib.load_story_files(
+            path)["story"] or {})
+        have = set(o.name for o in bpy.data.objects)
+        if _objs and not (_objs & have):
+            return
+    except Exception:
+        return
+    try:
         uids = dict(lib.load_sidecar(lib.sync_path_for(path))["uids"])
         for uid, rec in live_uids(stamp=False).items():
             uids[uid] = rec

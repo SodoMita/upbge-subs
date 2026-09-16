@@ -316,6 +316,34 @@ assert "tw.apply_renames" not in ops, "no renames pending -> no Apply button"
 log("panel: enum items %s, wrap+story box drew %d calls"
     % ([i[0] for i in items], len(fl.log)))
 
+# --- 10) the save-time sidecar refresh must not hijack another scene ------
+# (saving a scratch .blend that sits in the same folder as someone's story
+# used to rewrite that story's sidecar with the scratch scene's actions)
+sy = os.path.join(FIX, "story.sync.json")
+before = open(sy).read()
+_lib, _loaded = tw.load_story(scene)          # names the story uses NOW
+_refs, _objs, _cams = tw.story_refs(_lib, _loaded["story"])
+renamed = {}
+for oname in sorted(_objs):                   # (renamed by sections 5-7)
+    o = bpy.data.objects.get(oname)
+    if o is not None:
+        renamed[oname] = "scratch_" + oname      # story name -> scratch name
+        o.name = renamed[oname]
+assert renamed, "the story must reference at least one object"
+tw.write_sync_files(scene)
+assert open(sy).read() == before, "a scene without the story must not write"
+log("save guard: scratch scene left story.sync.json alone")
+for oldname, newname in renamed.items():
+    bpy.data.objects[newname].name = oldname
+bpy.context.view_layer.objects.active = actor
+actor.location = (9.0, 0, 0)
+actor.keyframe_insert("location", frame=80)   # widens main__act to [1, 80]
+tw.write_sync_files(scene)
+after = json.load(open(sy))["actions"]["main__act"]
+assert after == [1, 80], after
+log("save guard: the owning scene still refreshes it (%s)" % (after,))
+actor.keyframe_clear() if hasattr(actor, "keyframe_clear") else None
+
 for coll in (bpy.data.actions, bpy.data.meshes, bpy.data.curves,
              bpy.data.cameras):
     for x in list(coll):
