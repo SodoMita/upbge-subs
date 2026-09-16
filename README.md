@@ -144,7 +144,11 @@ rename, and a rename is a pending edit rather than a broken story.
 visibility keys, so scrubbing, rendering and the Graph Editor need no add-on
 and no code; without the add-on each cue is a clean full-line card). Re-baking
 reuses the same names, so a re-bake replaces its own previous bake instead of
-stacking `.001` copies. **Jump to Set** is gone: the Preview Set buttons do
+stacking `.001` copies. A set that is
+baked keeps its **source plate silent** (live typing off *and* an empty body,
+enforced on save by `tw_save_pre`) — otherwise the stale multi-line body
+renders on top of the baked cues, which is exactly the garble this rule
+removes. **Jump to Set** is gone: the Preview Set buttons do
 that job (and much more).
 
 ## Files
@@ -176,7 +180,7 @@ that job (and much more).
 ## Reproduce / re-render (Linux, headless-safe)
 
 ```bash
-cd /home/user/talking_robots          # or wherever you cloned this
+cd ~/talking_robots                    # wherever you cloned this repo
 U=/home/user/upbge/upbge-0.50-linux-x64   # UPBGE 0.50 (Blender 5.0.1)
 
 # 0. headless tests (no Blender needed)
@@ -221,7 +225,9 @@ blenderplayer -w 640 360 talking_robots_capture.blend   # → capture/game_*.png
   `frame_end` shows exactly what the player will see when the set stops. A set
   ending in `stop` disarms it. If the menu ever carries its own action, the
   add-on steps aside (hand-authored keys always win), and the game writes the
-  text per tick anyway.
+  text per tick anyway. Saving with the menu visible keeps that text in the file
+  (what you see is what gets saved) — re-preview the set, or scrub off the
+  tail, for a clean default.
 - **Subtitles sit just in front of the camera, not in the scene.** The live
   text and the menu are parented to the render camera at 0.45 units with a
   small size (0.015 / 0.009) — the same apparent size as a 3 m plate with

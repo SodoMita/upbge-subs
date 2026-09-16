@@ -130,11 +130,69 @@ $U/blender -b talking_robots.blend -P register_addon.py -o //test/xa_ -f 30   # 
 $U/blender -b talking_robots.blend -o //test/x_ -f 30                        # no addon
 ```
 
-`/tmp/reg_addon.py` (recreate, /tmp does not persist):
+`/tmp/reg_addon.py` (recreate, /tmp does not persist; point it at the repo):
+
 ```python
-import sys; sys.path.insert(0, "/home/user/talking_robots")
+import sys; sys.path.insert(0, "/home/user/upbge-subs")   # repo root
 import typewriter_subtitles as tw; tw.register()
 ```
+
+Idempotency check (a rebuild must never lose keys or duplicate bricks):
+snapshot per-action keyframe counts + object/baked/brick counts, rebuild over
+the saved file, then compare. Last run on the shipped files: IDENTICAL
+(21 actions, 8 baked objects, 54 objects, 1 sensor, 1 controller) - and it is
+what caught gotchas 10 and 11. The script:
+
+```bash
+cat > /tmp/keycount.py <<'PY'
+import bpy, json, os
+out = {}
+for a in bpy.data.actions:
+    out[a.name] = sum(len(fc.keyframe_points) for L in a.layers
+                      for s in L.strips for cb in s.channelbags
+                      for fc in cb.fcurves)
+out["__objects"] = len(bpy.data.objects)
+out["__baked"] = len([o for o in bpy.data.objects if "_Line" in o.name])
+out["__sensors"] = len(bpy.data.objects["GameDirector"].game.sensors)
+out["__controllers"] = len(bpy.data.objects["GameDirector"].game.controllers)
+out["__frames"] = "%d-%d" % (bpy.context.scene.frame_start,
+                             bpy.context.scene.frame_end)
+out["__markers"] = len(bpy.context.scene.timeline_markers)
+open("/tmp/count_%s.json" % os.environ.get("TAG", "x"), "w").write(
+    json.dumps(out, indent=1, sort_keys=True))
+print("COUNTS written", flush=True)
+PY
+U=/home/user/upbge/upbge-0.50-linux-x64
+TAG=before $U/blender -b talking_robots.blend -P /tmp/keycount.py
+xvfb-run -a -s "-screen 0 1280x800x24" \
+    $U/blender talking_robots.blend -P build_scene.py     # additive refresh
+TAG=after $U/blender -b talking_robots.blend -P /tmp/keycount.py
+diff /tmp/count_before.json /tmp/count_after.json && echo IDENTICAL
+```
+
+Stills: `test/` now holds v2 frames only (the v1 `br_*`/`fx_*`/`st_*`/`v8*`
+shots were dropped - they showed the removed markers + baked-camera pipeline).
+A single set-preview frame comes from `preview_set_impl` + one frame render:
+
+```bash
+cat > /tmp/still.py <<'PY'
+import bpy, os, sys
+sys.path.insert(0, "/home/user/upbge-subs")
+import typewriter_subtitles as tw
+if not hasattr(bpy.types.Object, "tw_entries"):
+    tw.register()
+SET = os.environ.get("STILL_SET", "")
+if SET:
+    ok, msgs = tw.preview_set_impl(bpy.context.scene, SET)
+    print("[STILL]", SET, ok, "; ".join(msgs)[:120], flush=True)
+    bpy.context.scene.frame_set(min(30, bpy.context.scene.frame_end))
+    bpy.context.view_layer.update()
+# no quit_blender(): a -b run exits on its own (and must not before -f)
+PY
+STILL_SET=cuby $U/blender -b talking_robots.blend -P /tmp/still.py \
+    -o //test/v2_cuby_ -F PNG -f 30
+```
+
 
 ## Gotchas (earned the hard way — respect all of them)
 
@@ -205,7 +263,13 @@ import typewriter_subtitles as tw; tw.register()
     depsgraph handlers and on load) decides visibility: shown when
     `frame >= scene.frame_end - max(2, round(fps*MENU_LEAD))` and the armed text
     is non-empty, hidden otherwise, and never when the menu has its own action.
-19. `Scene.tw_uid_seq` (int ID property) is the uid counter; `name_watch_scan`
+19. A **baked set must keep its source plate silent**: `preview_set_impl`
+    clears `tw_enabled` *and* `data.body` for the multi-line plate when
+    `<set>_Line##` objects exist, and `tw_save_pre` re-clears multi-entry
+    plates on save. Without that, the file keeps the last live body and every
+    render (with or without the add-on) draws it over the baked cues — that is
+    what the garbled `test/v2_noaddon_*.png` looked like before this rule.
+20. `Scene.tw_uid_seq` (int ID property) is the uid counter; `name_watch_scan`
     skips automatic work when `bpy.app.background` (so headless builds stay
     deterministic) unless called with `force=True` — that is how
     `test_addon_story.py` drives the watcher.

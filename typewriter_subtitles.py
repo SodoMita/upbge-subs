@@ -2581,10 +2581,11 @@ def preview_set_impl(scene, set_name, jump=True):
             # (and type, while the add-on runs). Leaving the source enabled as
             # well would draw the same line twice, so this mirrors the bake:
             # baked set -> live typing off, unbaked set -> on.
-            if sub.tw_enabled:
+            if sub.tw_enabled or sub.data.body:
                 sub.tw_enabled = False
+                sub.data.body = ""      # else the stale body overlaps the bake
             msgs.append("%d baked line(s) for this set carry the text - live "
-                        "typing off (Bake to Objects refreshes them)"
+                        "typing off, plate cleared (Bake to Objects refreshes)"
                         % len(baked_here))
         elif not sub.tw_enabled:
             # Bake to Objects turns live typing off on its source; a preview
@@ -2646,6 +2647,21 @@ def preview_set_impl(scene, set_name, jump=True):
         pass
     _redraw_panels()
     return True, msgs
+
+
+def _set_is_baked(scene):
+    """True when the previewed set has its own baked <set>_Line## objects."""
+    try:
+        set_name = (scene.tw_preview_set or "").strip()
+    except Exception:
+        return False
+    if not set_name:
+        return False
+    tag = "%s_Line" % set_name
+    for o in scene.objects:
+        if o.type == 'FONT' and o.name.startswith(tag):
+            return True
+    return False
 
 
 def sync_bake_visibility(scene, set_name, set_names):
@@ -3368,15 +3384,24 @@ def tw_save_pre(*args):
     without the add-on show clean subtitles. Live state is frame-derived,
     so nothing needs stashing - tw_save_post recomputes it after the save.
     Never raises (must not endanger the save)."""
+    scene = bpy.context.scene
+    baked = False
+    try:
+        baked = scene is not None and _set_is_baked(scene)
+    except Exception:
+        baked = False
     for obj in bpy.data.objects:
         try:
-            if obj.type != 'FONT' or not obj.tw_enabled:
+            if obj.type != 'FONT':
                 continue
             entries = obj.tw_entries
-            if len(entries) != 1:
-                continue
-            if obj.data.body != entries[0].text:
-                obj.data.body = entries[0].text
+            if len(entries) == 1 and obj.tw_enabled:
+                if obj.data.body != entries[0].text:
+                    obj.data.body = entries[0].text
+            elif len(entries) > 1 and baked and obj.data.body:
+                # a multi-line plate superseded by its own bake must be saved
+                # empty, or the stale body renders on top of the baked lines
+                obj.data.body = ""
         except Exception:
             pass
 

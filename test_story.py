@@ -416,4 +416,24 @@ assert not os.path.exists(sp2 + ".tmp"), "temp file must be renamed away"
 shutil.rmtree(tmp2, ignore_errors=True)
 print("rename/rewrite ok")
 
+# 15) the add-on's private copy of menu_body must match story.menu_body
+#     (the add-on stays a single installable file, so it embeds its own)
+def _addon_fn(src, tree, name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            ns2 = {}
+            exec(ast.get_source_segment(src, node), ns2)
+            return ns2[name]
+    raise AssertionError("add-on lost %s" % name)
+
+
+addon_menu = _addon_fn(addon_src, tree, "menu_body_for")
+cases = [[[1, "A", "x"], [2, "B", "y"]], [], [[9, "only", "z"]],
+          [[1, "Ask Cuby about cubes", "cuby"],
+           [2, "Ask Sphero about spheres", "sphero"]]]
+for c in cases:
+    assert addon_menu(c) == story.menu_body(c), c
+assert "> 1:" in addon_menu(cases[-1]) and "\n  2:" in addon_menu(cases[-1])
+print("menu_body parity ok")
+
 print("ALL STORY TESTS PASSED")

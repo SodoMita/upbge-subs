@@ -257,6 +257,14 @@ assert not any(o.hide_render for o in bpy.data.objects
 ok, msgs = tw.preview_set_impl(scene, "main")      # main IS baked
 assert sub.tw_enabled is False, "baked set: no double text"
 assert not _b.hide_render, "previewed set's bake is shown again"
+assert sub.data.body == "", "baked set: the plate stays silent: %r" \
+    % sub.data.body
+sub.data.body = "STALE"                       # simulate a dirty plate
+tw.tw_save_pre()
+assert sub.data.body == "", "save_pre must clear a superseded plate"
+sub.tw_enabled = True
+tw._update_body_impl(sub, scene)              # live typing works again
+sub.tw_enabled = False
 assert len(sub.tw_entries) == 2, len(sub.tw_entries)   # back to main's cues
 log("bake visibility: per set, no stacked text")
 
