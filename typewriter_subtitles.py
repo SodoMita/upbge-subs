@@ -15,7 +15,7 @@
 bl_info = {
     "name": "Typewriter Subtitles (3D Text Keyframes)",
     "author": "Arena Agent",
-    "version": (1, 9, 0),
+    "version": (1, 9, 1),
     "blender": (2, 83, 0),
     "location": "3D Viewport > Sidebar (N) > Subtitles;  Add > Text > Typewriter Subtitles;  File > Import/Export",
     "description": "3D text subtitles on timeline keyframes + animation-centric "
@@ -26,7 +26,9 @@ bl_info = {
                    "after editing it externally; lines are auto-backed-up on the "
                    "object, with one-click Rebuild / Recover. For stories: Preview "
                    "Set aims the scene at one set of story.yml (its cues, its "
-                   "actions, its shot, its menu, its length), Refresh Sync writes "
+                   "actions, its shot, its menu, its length - and drives the "
+                   "render camera through the set's shots exactly like the "
+                   "game does), Refresh Sync writes "
                    "story.sync.json + the VSCode schema (also on save), Check "
                    "validates the story against the scene, and a rename watch keeps "
                    "story.yml's references in step. Bake to Objects freezes typing "
@@ -2139,19 +2141,63 @@ def set_entries_from_plan(obj, scene, plan, fps, frame_start):
     return len(frames)
 
 
+def _slot_id_type(host):
+    """Slot id type for an AnimData host (Blender 5 matches slots by type)."""
+    try:
+        if host is not None and host.type == 'MESH' \
+                and getattr(host, "animation_data", None) is None:
+            return 'MESH'          # shape-key animation lives on the mesh
+    except Exception:
+        pass
+    return 'OBJECT'
+
+
 def _slot_for(action, obj):
-    """The action slot driving `obj` (created when the action has none)."""
-    slots = list(getattr(action, "slots", []) or [])
-    for s in slots:
+    """The action slot driving `obj` (created when the action has none).
+
+    Blender 5 actions are slotted, and an action assigned to an object it was
+    not authored on evaluates SILENTLY unless `action_slot` is set: no error,
+    no motion. Prefer the slot named after this object, then one Blender itself
+    calls suitable for this AnimData (a renamed object keeps its original
+    "OB<old name>" slot, which is why names come second), then a slot of the
+    right id type; only a lone foreign slot is accepted when nothing else
+    matches, and a fresh one is created as a last resort.
+    """
+    want = "OB" + obj.name
+    ad = getattr(obj, "animation_data", None)
+    try:
+        suitable = list(ad.action_suitable_slots)
+    except Exception:
+        suitable = []
+    for s in suitable:
         try:
-            if s.identifier == "OB" + obj.name:
+            if s.identifier == want:
                 return s
         except Exception:
-            pass
+            continue
+    if len(suitable) == 1:
+        return suitable[0]
+    slots = list(getattr(action, "slots", []) or [])
+    idt = _slot_id_type(obj)
+    for s in slots:
+        try:
+            if s.identifier == want:
+                return s
+        except Exception:
+            continue
+    # slots have no id_type property in this build, but their identifier
+    # carries the host type: "OB" for objects, "ME" for mesh data.
+    pref = "OB" if idt == 'OBJECT' else "ME"
+    for s in slots:
+        try:
+            if str(s.identifier).startswith(pref):
+                return s
+        except Exception:
+            continue
     if slots:
         return slots[0]
     try:
-        return action.slots.new(id_type='OBJECT', name=obj.name)
+        return action.slots.new(id_type=idt, name=obj.name)
     except Exception:
         return None
 
@@ -2208,6 +2254,204 @@ def snap_opening_shot(scene, plan):
     except Exception as ex:
         return "camera snap failed: %r" % (ex,)
     return ""
+CAM_BLEND = 0.5          # seconds a camera move eases over (game parity)
+_PLAN_CACHE = {}         # the armed preview's plan, so a tick stays cheap
+
+
+def _mtime_of(path):
+    """getmtime or -1.0 (a missing sidecar must not blind the cache key)."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1.0
+
+
+def preview_plan(scene, reload=False):
+    """The armed preview set's runtime plan (None when nothing is armed).
+
+    Cached on (set, fps, frame_start, story mtime): the frame handler calls
+    this every frame and must not re-read story.yml each time. The cache is
+    dropped whenever no set is previewed, so a stale plan can never outlive a
+    preview.
+    """
+    name = (getattr(scene, "tw_preview_set", "") or "").strip()
+    if not name:
+        _PLAN_CACHE.clear()
+        return None
+    path = story_path_of(scene)
+    if not path:
+        return None
+    fps = scene_fps(scene)
+    key = (name, round(float(fps), 6), int(scene.frame_start),
+           _mtime_of(path), _mtime_of(os.path.splitext(path)[0]
+                                      + ".sync.json"))
+    if not reload and _PLAN_CACHE.get("key") == key:
+        return _PLAN_CACHE.get("plan")
+    lib, loaded = load_story(scene, quiet=True)
+    if lib is None or loaded is None or loaded["errors"]:
+        _PLAN_CACHE.clear()
+        return None
+    if name not in (loaded["story"].get("sets") or {}):
+        _PLAN_CACHE.clear()          # the armed set is gone from the story:
+        return None                  # stop following rather than raise
+    try:
+        side = lib.load_sidecar(lib.sync_path_for(path))
+        ranges = dict(side["actions"])
+        ranges.update(live_action_ranges())
+        plan = lib.set_plan(loaded["story"], loaded["files"], name,
+                       ranges, fps)
+    except Exception:
+        _PLAN_CACHE.clear()          # a per-frame handler must never raise
+        return None
+    _PLAN_CACHE.clear()
+    _PLAN_CACHE.update({"key": key, "plan": plan})
+    return plan
+
+
+def _mat_close(a, b, tol=1e-6):
+    """True when two 4x4 matrices agree (write nothing when they do)."""
+    for r1, r2 in zip(a, b):
+        for x, y in zip(r1, r2):
+            if abs(x - y) > tol:
+                return False
+    return True
+
+
+def _shot_lens(o):
+    """A staged shot's lens, or None when it carries no camera data.
+
+    The game takes only the TRANSFORM from a [CAM] target, so an Empty (or an
+    actor) is a legal shot; the lens then eases only between two camera shots.
+    """
+    try:
+        return float(o.data.lens)
+    except Exception:
+        return None
+
+
+def camera_pose_at(cam, shots, t):
+    """Pose `cam` for preview time t -> (changed, message).
+
+    The game's rule (the LAST shot at or before t, easing in from the one
+    before it over CAM_BLEND with a smoothstep on position/rotation/lens) but
+    as a pure function of t, so scrubbing the timeline and rendering frames
+    reproduce what press P shows. The game eases from wherever the camera
+    happened to be; the editor always eases from the previous shot's pose, so
+    an interrupted move snaps instead of drifting. Nothing is keyed here - the
+    camera is only posed, which is why a render with the add-on off still shows
+    the opening framing (the saved file holds no camera animation at all).
+    """
+    if cam is None or not shots:
+        return False, ""
+    idx = 0
+    for i, (st, _name) in enumerate(shots):
+        if st <= t + 1e-6:
+            idx = i
+    name = shots[idx][1]
+    cur = bpy.data.objects.get(name)
+    if cur is None:
+        return False, "shot '%s' is not in the scene" % name
+    prev = None
+    k = 0.0
+    if idx > 0 and t - shots[idx][0] < CAM_BLEND:
+        prev = bpy.data.objects.get(shots[idx - 1][1])
+        if prev is None:
+            k = 0.0
+        else:
+            k = max(0.0, min(1.0, (t - shots[idx][0]) / CAM_BLEND))
+            k = k * k * (3.0 - 2.0 * k)
+    if prev is None:
+        want = cur.matrix_world.copy()
+        lens = _shot_lens(cur)
+    else:
+        m0, m1 = prev.matrix_world, cur.matrix_world
+        q0, q1 = m0.to_quaternion(), m1.to_quaternion()
+        if q0.dot(q1) < 0.0:
+            q1 = -q1
+        want = Matrix.LocRotScale(m0.translation.lerp(m1.translation, k),
+                                  q0.slerp(q1, k), None)
+        l0, l1 = _shot_lens(prev), _shot_lens(cur)
+        lens = None if (l0 is None or l1 is None) else l0 + (l1 - l0) * k
+    if cam.parent is not None:
+        try:
+            want = cam.parent.matrix_world.inverted() @ want
+        except Exception as ex:
+            return False, "camera parent failed: %r" % (ex,)
+    changed = False
+    if not _mat_close(cam.matrix_basis, want):
+        cam.matrix_basis = want
+        changed = True
+    if lens is not None and abs(float(cam.data.lens) - lens) > 1e-6:
+        cam.data.lens = lens
+        changed = True
+    return changed, ""
+
+
+def preview_camera_tick(scene):
+    """Follow the previewed set's shots with the render camera (editor only).
+
+    Runs from the frame handler (and on file load) while a set is previewed
+    and Scene.tw_preview_camera is on - deliberately NOT from the depsgraph
+    update, so editing anything else never snaps the view back under your
+    mouse. It works inside the previewed range only, so leaving the range hands
+    the camera back, and it is skipped when the render camera carries an action
+    of its own (hand-authored keys always win - the same rule the menu uses)
+    and in the game (handlers do not run there; the driver moves the camera
+    instead). Returns True when it posed the camera.
+    """
+    if scene is None or not getattr(scene, "tw_preview_camera", False):
+        return False
+    plan = preview_plan(scene)
+    if not plan or not plan.get("shots"):
+        return False
+    f0 = int(scene.frame_start)
+    frame = int(scene.frame_current)
+    if frame < f0 or frame > int(scene.frame_end):
+        return False
+    cam = scene.camera
+    if cam is None:
+        return False
+    ad = cam.animation_data
+    if ad is not None and ad.action is not None:
+        return False
+    changed, err = camera_pose_at(cam, plan["shots"],
+                                 (frame - f0) / max(float(scene_fps(scene)),
+                                                    1e-6))
+    if err and _PLAN_CACHE.get("cam_err") != err:
+        _PLAN_CACHE["cam_err"] = err
+        _say("preview camera: %s" % err)
+    return changed
+
+
+def clear_preview_impl(scene):
+    """Leave the set preview -> (ok, [messages]).
+
+    A preview is a *state* (whose cues, whose actions, whose baked lines the
+    editor shows), so leaving it means aiming back at the story's start set -
+    the state the saved file is in - and switching the per-frame camera follow
+    off so the camera is yours again. Nothing is deleted: every action stays
+    assigned and every key stays put.
+    """
+    lib, loaded = load_story(scene, quiet=True)
+    if lib is None or loaded is None:
+        return False, ["story.yml/story.py not found next to the blend"]
+    if loaded["errors"]:
+        return False, ["story has errors - fix them first: "
+                       + "; ".join(loaded["errors"][:3])]
+    start = str((loaded["story"] or {}).get("start") or "")
+    if not start:
+        return False, ["story.yml names no start set"]
+    ok, msgs = preview_set_impl(scene, start, jump=True)
+    if not ok:
+        return False, msgs
+    try:
+        scene.tw_preview_camera = False
+    except Exception:
+        pass
+    msgs.append("camera follow off - tick the box to let Preview Set drive it "
+                "again")
+    return True, msgs
+
 
 
 def sync_speakers(scene, loaded, plan, fps, frame_start, set_name):
@@ -2422,6 +2666,7 @@ def refresh_sync_impl(scene, write_schema=True):
             rep["warnings"].append("schema not written (%r)" % (ex,))
     rep["renames"] = renames
     _NAME_SNAPSHOT.clear()
+    _PLAN_CACHE.clear()
     _NAME_SNAPSHOT.update({k: (v["name"], v["type"])
                            for k, v in live.items()})
     _CHECK_STATE.update({"stamp": time.strftime("%H:%M:%S")})
@@ -2467,6 +2712,7 @@ def name_watch_scan(scene, force=False):
     if not force and cur == _NAME_SNAPSHOT:
         return []
     _NAME_SNAPSHOT.clear()
+    _PLAN_CACHE.clear()
     _NAME_SNAPSHOT.update(cur)
     renames, _new, _gone = lib.diff_uids(_sidecar_uids(scene, lib), live)
     renames = [r for r in renames if r["type"] in ("object", "action",
@@ -2815,6 +3061,29 @@ class TW_OT_preview_set(bpy.types.Operator):
         return {'FINISHED'} if ok else {'CANCELLED'}
 
 
+class TW_OT_clear_preview(bpy.types.Operator):
+    bl_idname = "tw.clear_preview"
+    bl_label = "Leave Preview"
+    bl_description = ("Stop previewing a set: aim the timeline back at the "
+                      "story's start set (the state the file is saved in), "
+                      "hand the render camera back and stop the per-frame "
+                      "follow. Nothing is deleted")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(story_path_of(context.scene)) and bool(
+            getattr(context.scene, "tw_preview_set", ""))
+
+    def execute(self, context):
+        ok, msgs = clear_preview_impl(context.scene)
+        for m in msgs:
+            self.report({'INFO'} if ok else {'WARNING'}, m)
+        if ok:
+            _say("leave preview: %s" % "; ".join(msgs) or "ok")
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
 class TW_OT_refresh_sync(bpy.types.Operator):
     bl_idname = "tw.refresh_sync"
     bl_label = "Refresh Sync"
@@ -2905,7 +3174,13 @@ def _story_box(layout, context):
         box.label(text="No story.yml next to the blend", icon='INFO')
         return
     box.column(align=True).operator_enum("tw.preview_set", "set_id")
+    if story_path_of(scene):
+        box.prop(scene, "tw_preview_camera",
+                 text="Camera follows the preview")
     row = box.row(align=True)
+    if scene.tw_preview_set:
+        row.operator("tw.clear_preview", text="Leave Preview",
+                     icon='RESTAUTO')
     row.operator("tw.refresh_sync", text="Refresh Sync", icon='FILE_REFRESH')
     row.operator("tw.check_story", text="Check", icon='CHECKMARK')
     if len(scene.tw_pending_renames):
@@ -3263,6 +3538,7 @@ def tw_frame_change(scene, depsgraph=None):
     _IN_HANDLER = True
     try:
         _menu_tick(scene)
+        preview_camera_tick(scene)
         for obj in scene.objects:
             if obj.type == 'FONT' and (len(obj.tw_entries) or obj.tw_auto_reload):
                 try:
@@ -3378,8 +3654,10 @@ def tw_load_post_story(*args):
     if scene is None or bpy.app.background:
         return
     _NAME_SNAPSHOT.clear()
+    _PLAN_CACHE.clear()
     try:
         _menu_tick(scene)
+        preview_camera_tick(scene)
         story_check_impl(scene)
         name_watch_scan(scene, force=True)
     except Exception:
@@ -3457,6 +3735,7 @@ classes = (
     TW_RenameItem,
     TW_UL_renames,
     TW_OT_preview_set,
+    TW_OT_clear_preview,
     TW_OT_refresh_sync,
     TW_OT_check_story,
     TW_OT_apply_renames,
@@ -3527,8 +3806,9 @@ def register():
                     "when it changes on disk",
         default=False)
 
-    for prop in ("tw_story", "tw_preview_set", "tw_autorewrite",
-                 "tw_pending_renames", "tw_rename_index"):
+    for prop in ("tw_story", "tw_preview_set", "tw_preview_camera",
+                 "tw_autorewrite", "tw_pending_renames",
+                 "tw_rename_index"):
         if hasattr(bpy.types.Scene, prop):
             try:
                 delattr(bpy.types.Scene, prop)
@@ -3545,6 +3825,13 @@ def register():
         description="Story set the timeline is currently aimed at (set by "
                     "Preview Story Set; also the Bake to Objects name prefix)",
         default="")
+    bpy.types.Scene.tw_preview_camera = bpy.props.BoolProperty(
+        name="Camera follows the preview",
+        description="While a set is previewed, pose the render camera for "
+                    "each frame from the set's shots (the same cuts and "
+                    "easing the game does). Off = the camera stays where "
+                    "Preview Set snapped it; your own keys always win",
+        default=True)
     bpy.types.Scene.tw_autorewrite = bpy.props.BoolProperty(
         name="Auto-rewrite refs on rename",
         description="Rewrite story.yml (+ [CAM] lines) the moment a referenced "
@@ -3637,8 +3924,9 @@ def unregister():
             delattr(bpy.types.Object, prop)
         except Exception:
             pass
-    for prop in ("tw_story", "tw_preview_set", "tw_autorewrite",
-                 "tw_pending_renames", "tw_rename_index"):
+    for prop in ("tw_story", "tw_preview_set", "tw_preview_camera",
+                 "tw_autorewrite", "tw_pending_renames",
+                 "tw_rename_index"):
         try:
             delattr(bpy.types.Scene, prop)
         except Exception:

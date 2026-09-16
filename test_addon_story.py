@@ -344,6 +344,193 @@ assert after == [1, 80], after
 log("save guard: the owning scene still refreshes it (%s)" % (after,))
 actor.keyframe_clear() if hasattr(actor, "keyframe_clear") else None
 
+# --- 11) the preview drives the render camera exactly like the game -------
+# A second, self-contained project: one set, two shots, a cut at 2.5 s.
+FIX2 = tempfile.mkdtemp(prefix="twfix2")
+
+
+def w2(name, text):
+    with open(os.path.join(FIX2, name), "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+# the earlier sections renamed the story's objects (that is what the rename
+# watch is for), so pick the live cameras by type and author the cut with those
+cams = [o for o in scene.objects
+        if o.type == 'CAMERA' and o is not scene.camera]
+assert len(cams) >= 2, [o.name for o in scene.objects if o.type == 'CAMERA']
+wide = min(cams, key=lambda o: o.location.y)     # the one further back
+close = max(cams, key=lambda o: o.location.y)    # the tighter one
+w2("cut.srt", "1\n00:00:00,000 --> 00:00:01,000\nfirst line\n\n"
+              "2\n00:00:02,500 --> 00:00:03,500\n[CAM %s]\nafter the cut\n"
+              % close.name)
+w2("story.yml", "start: cam\ncps: 30\nsets:\n  cam:\n    anims:\n"
+                "      - subs: cut.srt#1-2\n      - camera: %s\n"
+                "    end: stop\n"
+                % wide.name)
+shutil.copy(os.path.join(HERE, "story.py"), os.path.join(FIX2, "story.py"))
+story1 = scene.tw_story
+scene.tw_story = os.path.join(FIX2, "story.yml")
+scene.frame_start = 1
+scene.tw_preview_camera = True
+cam = scene.camera
+assert cam.parent is None and wide.parent is None, "fixture assumes no parents"
+
+
+def pose():
+    return (tuple(round(v, 4) for v in cam.matrix_basis.translation),
+            round(float(cam.data.lens), 3))
+
+
+def of(o):
+    return (tuple(round(v, 4) for v in o.matrix_world.translation),
+            round(float(o.data.lens), 3))
+
+
+WP, CL = of(wide), of(close)
+
+
+def blend(k):
+    """The eased pose at smoothstep(k), computed without the add-on."""
+    kk = k * k * (3.0 - 2.0 * k)
+    return (tuple(round(WP[0][i] + (CL[0][i] - WP[0][i]) * kk, 4)
+                  for i in range(3)),
+            round(WP[1] + (CL[1] - WP[1]) * kk, 3))
+
+
+def goto(t):
+    """Jump like the user does and read the pose the handler produced."""
+    scene.frame_set(1 + int(round(t * FPS)))
+    bpy.context.view_layer.update()
+    return pose()
+
+
+ok, msgs = tw.preview_set_impl(scene, "cam")
+assert ok, msgs
+assert int(scene.frame_end) == 85, msgs            # 3.5 s of cues at 24 fps
+snap = pose()
+assert snap == WP, snap        # snapped to the set's opening shot
+assert blend(0.0) == WP and blend(1.0) == CL, (blend(0.0), blend(1.0))
+assert goto(0.0) == WP and goto(1.0) == WP, pose()       # still holding Wide
+assert goto(2.75) == blend(0.5), (pose(), blend(0.5))    # eased half-way
+assert tw.preview_camera_tick(scene) is False, \
+    "no write when the camera is already posed"          # idempotent tick
+assert goto(3.1) == CL, (pose(), CL)                      # exactly Close
+log("camera follow: Wide %s -> eased -> Close %s" % (WP, CL))
+# deterministic: the same t always gives the same pose (scrub + render proof)
+seen = {}
+for t in (0.0, 1.0, 2.75, 3.1):
+    seen[t] = goto(t)
+for t in (3.1, 2.75, 1.0, 0.0, 2.75, 0.0, 3.1):
+    assert goto(t) == seen[t], (t, pose(), seen[t])
+log("follow is a pure function of t: 7 replays, 0 differences")
+# it really does write when the pose is wrong (no frame change involved)
+cam.matrix_basis.translation = (0.0, 0.0, 0.0)
+assert tw.preview_camera_tick(scene) is True, "a wrong pose must be fixed"
+assert pose() == seen[3.1], (pose(), seen[3.1])   # the frame still shows 3.1
+# outside the previewed range the camera is left alone
+scene.frame_set(int(scene.frame_end) + 4)
+bpy.context.view_layer.update()
+assert tw.preview_camera_tick(scene) is False and pose() == seen[3.1], pose()
+scene.frame_set(1)
+goto(2.75)
+# hand-authored camera keys always win (same rule the menu uses)
+keep = bpy.data.actions.new("CamHand")
+kslot = keep.slots.new(id_type='OBJECT', name=cam.name)
+ad = cam.animation_data or cam.animation_data_create()
+ad.action = keep
+ad.action_slot = kslot
+cam.location = (9.0, 9.0, 9.0)
+cam.keyframe_insert("location", frame=1)
+cam.keyframe_insert("location", frame=85)
+bpy.context.view_layer.update()
+assert tw.preview_camera_tick(scene) is False, "follow ran over hand keys"
+ad.action = None
+bpy.data.actions.remove(keep)
+# the checkbox hands the camera back
+cam.matrix_basis.translation = (0.0, 0.0, 0.0)
+scene.tw_preview_camera = False
+held = pose()
+for t in (0.0, 2.75, 3.1):                          # lens included: nothing at
+    assert goto(t) == held, (t, pose(), held)       # all is written when off
+scene.tw_preview_camera = True
+assert goto(2.75) == blend(0.5), (pose(), blend(0.5))
+# the plan is cached (per-frame cost matters) and invalidated on a story edit
+p1 = tw.preview_plan(scene)
+assert p1 is tw.preview_plan(scene) is not None
+os.utime(os.path.join(FIX2, "story.yml"), (os.path.getmtime(
+    os.path.join(FIX2, "story.yml")) + 3,) * 2)
+assert tw.preview_plan(scene) is not p1, "plan cache ignored the story edit"
+# Leave Preview: back to the start set, follow off, nothing deleted
+ok, msgs = tw.clear_preview_impl(scene)
+assert ok, msgs
+assert scene.tw_preview_set == "cam" and scene.tw_preview_camera is False, msgs
+cam.matrix_basis.translation = (1.0, 2.0, 3.0)
+tw.preview_plan(scene, reload=True)
+goto(2.75)
+assert pose()[0] == (1.0, 2.0, 3.0), "Leave Preview still drove the camera"
+assert len(bpy.data.objects["Subtitles"].tw_entries) == 2, "cues still loaded"
+assert hasattr(bpy.ops.tw, "clear_preview"), "the operator is registered"
+scene.tw_story = story1
+shutil.rmtree(FIX2, ignore_errors=True)
+log("preview camera + Leave Preview behave")
+
+# --- 12) slot resolution for shared/renamed objects (Blender 5 slotted) ---
+shared = bpy.data.actions.new("shared")
+shared.slots.new(id_type='MESH', name="MeshSlot")      # wrong host, first
+so = shared.slots.new(id_type='OBJECT', name=actor.name)
+ad2 = actor.animation_data
+old_action = ad2.action
+ad2.action = shared
+got = tw._slot_for(shared, actor)
+# RNA collections hand out a fresh wrapper per access, so compare with ==
+assert got == so and got.identifier == so.identifier, (got, so)
+actor.name = "ActorRenamed"
+assert tw._slot_for(shared, actor) == so, "a rename must not orphan the slot"
+assert len(shared.slots) == 2, [s.identifier for s in shared.slots]
+other = bpy.data.objects.new("Other", bpy.data.meshes.new("Other"))
+scene.collection.objects.link(other)
+ad3 = other.animation_data_create()
+ad3.action = shared
+assert str(tw._slot_for(shared, other).identifier).startswith("OB"), \
+    "never bind a mesh slot to an object"
+fresh = bpy.data.actions.new("fresh")
+ad3.action = fresh                      # assign the action first, as Blender 5
+made = tw._slot_for(fresh, other)       # wants (the slot must belong to it)
+assert made is not None and len(fresh.slots) == 1 \
+    and made.identifier == "OBOther", [s.identifier for s in fresh.slots]
+assert tw._slot_for(fresh, other) == made and len(fresh.slots) == 1, \
+    "a second call reuses its slot (no pile-up across rebuilds)"
+ad2.action = old_action
+actor.name = "Actor"
+bpy.data.objects.remove(other, do_unlink=True)
+for a in (shared, fresh):
+    bpy.data.actions.remove(a)
+log("slots: named slot wins, renames keep their slot, foreign hosts skip")
+
+# --- 13) the handler wiring actually calls the follow --------------------
+src = open(os.path.join(HERE, "typewriter_subtitles.py"),
+           encoding="utf-8").read()
+import ast as _ast
+_tree = _ast.parse(src)
+_wired = set()
+for _n in _ast.walk(_tree):
+    if isinstance(_n, _ast.FunctionDef) and _n.name in (
+            "tw_frame_change", "tw_depsgraph_update", "tw_load_post_story"):
+        for _m in _ast.walk(_n):
+            if isinstance(_m, _ast.Call) and getattr(_m.func, "id", "") == \
+                    "preview_camera_tick":
+                _wired.add(_n.name)
+assert _wired == {"tw_frame_change", "tw_load_post_story"}, _wired
+# deliberately NOT in the depsgraph handler: editing an unrelated object must
+# never snap the camera back (that would feel like a stuck view).
+for _n in _ast.walk(_tree):
+    if isinstance(_n, _ast.FunctionDef) and _n.name == "tw_depsgraph_update":
+        assert not any(isinstance(m, _ast.Call)
+                       and getattr(m.func, "id", "") == "preview_camera_tick"
+                       for m in _ast.walk(_n)), "follow wired twice"
+log("camera follow wired into %s" % ", ".join(sorted(_wired)))
+
 for coll in (bpy.data.actions, bpy.data.meshes, bpy.data.curves,
              bpy.data.cameras):
     for x in list(coll):
