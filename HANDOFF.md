@@ -162,6 +162,30 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
   ~900-capture budget at stride 2) and `CAPTURE_TICRATE` (slow logic
   clock for bounded trajectories on software GL). A talking-robots
   capture pass with the v2 story is still owed on a faster machine.
+  **Root cause of the old capture bug (agent probe, 2026-09-16):** the
+  previous `set_capture.py` set `d["CAPTURE"] = 1` — a *custom (id)
+  property*. In game mode UPBGE 0.50 does not expose the .blend's custom
+  properties on game objects at all (probe scene: `p_str`/`p_int`/
+  `p_float`/`CAPTURE` all raise `KeyError`; game properties are visible —
+  the driver reads `tw_story` that way). So capture mode never armed: no
+  screenshots, no auto-pick, no backstop, and the run looped the first
+  choice forever. `set_capture.py` now creates `CAPTURE` as a *game*
+  property (and takes any scene that has a GameDirector).
+- **Self-contained sway + pixman stack** (agent, 2026-09-16):
+  `tools/run_sway_capture.sh <blend>` brings up the whole display
+  software-free — sway with `WLR_BACKENDS=headless WLR_RENDERERS=pixman`,
+  Xwayland :1 (the engine's GHOST is X11-only in 0.50: it tries
+  back-end(s) `['X11']` and nothing else, and there is **no `--game`
+  CLI flag** — `--game` is parsed as a filename; use `blenderplayer` or
+  editor + `autostart_game.py`), llvmpipe for the game GL, and
+  optionally a PulseAudio null sink (`WITH_PULSE=1`) which is a verified
+  alternative to the audio patch for the unpatched binary (full
+  talking-robots story ran on the unpatched UI path with a null sink:
+  actors moved — `playAction` by name works with multi-action objects,
+  so no fallback is needed — choices auto-picked, 1800-tick backstop
+  fired, process exited on its own). `install_env.sh` rebuilds packages
+  + UPBGE 0.50 + swap from a bare box (system state does not survive a
+  sandbox snapshot; /opt and apt packages are wiped too).
 - **No audio content**: `./audio/` doesn't exist, so `audio:` anims and the
   speaker-strip path are only covered by the fake-`bge` tests. Blender 5 has
   no `bpy.data.sounds`/`AudioPreview`; the add-on uses
@@ -251,6 +275,12 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
 cd /home/user/talking_robots
 python3 test_story.py && python3 test_game_logic.py && python3 test_tw_game.py
 U=/home/user/upbge/upbge-0.50-linux-x64
+# --- software-GL proof stack (no GPU, no pre-existing display; Debian) ---
+sudo bash install_env.sh                        # apt + UPBGE 0.50 -> /opt + audio patch + swap
+$U/blender -b talking_robots.blend -P set_capture.py     # CAPTURE as a GAME property
+UPBGE=$U sh tools/run_sway_capture.sh talking_robots_capture.blend 420
+#   (brings up sway headless+pixman, Xwayland :1, llvmpipe; WITH_PULSE=1
+#    for unpatched binaries; evidence: game_debug.log + capture/)
 timeout 600 xvfb-run -a -s "-screen 0 1280x800x24" $U/blender --factory-startup -P build_scene.py
 timeout 300 xvfb-run -a -s "-screen 0 1280x800x24" $U/blender talking_robots.blend -P resave_game.py
 $U/blender -b talking_robots.blend -P verify_game.py
