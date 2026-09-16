@@ -5,14 +5,22 @@
 Read-only for the file on disk (it never saves): it loads the add-on from
 beside the .blend, validates the story + its bindings against the scene,
 checks the sync sidecar, the per-set actions, the baked text, the game bricks
-and the embedded driver, and proves the per-set preview works for every set
-(that part mutates the in-memory scene on purpose - press P is the real
-preview, this is the check that it can).
+and the embedded driver, proves the per-set preview works for every set (that
+part mutates the in-memory scene on purpose - press P is the real preview,
+this is the check that it can) and - unless TW_SKIP_BUILD_TWICE=1 - rebuilds
+the whole project in a THROWAWAY COPY of it and compares an action-key
+fingerprint before/after, so "build_scene.py is additive and idempotent"
+stays a proven fact and not a promise (a hand tweak to a key must survive a
+rebuild). The repo's own files are never written by that: it asserts so.
 """
+import hashlib
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -24,9 +32,223 @@ OK, FAIL = [], []
 
 
 def check(cond, what, detail=""):
+    if not isinstance(detail, str):        # lists/tuples/ints are fair game
+        detail = repr(detail)
     (OK if cond else FAIL).append(what + ((": " + detail) if detail else ""))
     print("VERIFY %s %s%s" % ("ok  " if cond else "FAIL", what,
                               " - " + detail if detail else ""))
+
+
+def log(msg):
+    """Progress line from a section that is not itself a check."""
+    print("VERIFY  %s" % msg, flush=True)
+
+
+FP_SCRIPT = r'''
+# Fingerprint of everything a rebuild could damage. Written and run by
+# verify_game's build_twice INSIDE a throwaway copy of the project. With
+# TW_TWEAK=<action> it also nudges that action's inner keys by +0.25 and saves,
+# so the second fingerprint proves a rebuild keeps hand-edited keys instead of
+# flattening them back to what the story's generator writes.
+import hashlib
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bpy
+import typewriter_subtitles as tw
+
+
+def dig(a):
+    rows = []
+    for fc in tw._action_fcurves(a):
+        for k in fc.keyframe_points:
+            rows.append([fc.data_path, round(k.co.x, 4), round(k.co.y, 6),
+                         str(k.interpolation)])
+    rows.sort()
+    return rows
+
+
+name = os.environ.get("TW_TWEAK")
+if name:
+    act = bpy.data.actions.get(name)
+    assert act is not None, "no action '%s' to tweak" % name
+    f0, f1 = [int(round(v)) for v in act.frame_range]
+    n = 0
+    for fc in tw._action_fcurves(act):
+        for k in fc.keyframe_points:
+            if f0 + 1 <= round(k.co.x) <= f1 - 1:
+                k.co.y += 0.25
+                n += 1
+        if n:
+            fc.update()
+    assert n, "action '%s' (frames %d-%d) has no inner key to nudge" % (
+        name, f0, f1)
+    print("[FP] nudged %d hand-tweak key(s) on '%s'" % (n, name), flush=True)
+
+fp = {"actions": {a.name: {
+          "keys": len(dig(a)),
+          "range": [int(round(v)) for v in a.frame_range],
+          "fake_user": a.use_fake_user,
+          "digest": hashlib.sha1(json.dumps(dig(a)).encode()).hexdigest()}
+      for a in bpy.data.actions},
+      "objects": sorted([o.name for o in bpy.data.objects]),
+      "meshes": sorted([m.name for m in bpy.data.meshes]),
+      "materials": sorted([m.name for m in bpy.data.materials]),
+      "uids": {o.name: o.get("_tw_uid") for o in bpy.data.objects
+               if o.get("_tw_uid")},
+      "frames": [int(bpy.context.scene.frame_start),
+                 int(bpy.context.scene.frame_end)]}
+with open(os.environ["TW_FP_OUT"], "w", encoding="utf-8", newline="\n") as fh:
+    json.dump(fp, fh, indent=1, sort_keys=True)
+print("[FP] %s: %d action(s), %d object(s), %d uid(s)"
+      % (os.environ["TW_FP_OUT"], len(fp["actions"]), len(fp["objects"]),
+         len(fp["uids"])), flush=True)
+if name:
+    bpy.ops.wm.save_mainfile()
+    print("[FP] saved the tweak", flush=True)
+'''
+
+
+def _sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for blk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def build_twice():
+    """Rebuild a COPY of the project and prove nothing was clobbered.
+
+    The claim this pins: build_scene.py is additive - re-running it over a file
+    that already holds the story's data changes nothing, and a hand edit to a
+    generated action's keys survives it. Done in a copy because the rebuild
+    saves. Skipped (with a log line, not a failure) when this environment
+    cannot re-exec Blender; `TW_SKIP_BUILD_TWICE=1` skips it on purpose.
+    """
+    log("=== build-twice proof (throwaway copy of the project) ===")
+    if os.environ.get("TW_SKIP_BUILD_TWICE"):
+        log("  SKIP: TW_SKIP_BUILD_TWICE is set")
+        return
+    # bpy.app.binary_path, NOT sys.executable: under UPBGE that is the bundled
+    # python, which would try to run the .blend as a script.
+    exe = getattr(bpy.app, "binary_path", "") or ""
+    if not exe or not os.path.isfile(exe):
+        log("  SKIP: bpy.app.binary_path is not a runnable binary (%r)" % exe)
+        return
+    repo_blend = os.path.join(HERE, "talking_robots.blend")
+    ld = sb.load_story_files(os.path.join(HERE, "story.yml"))
+    if ld["errors"]:
+        log("  SKIP: story does not load (%s)" % ld["errors"][:1])
+        return
+    fps = float(bpy.context.scene.render.fps) or 24.0
+    want = sorted({a for n in sorted(ld["story"]["sets"])
+                   for (_o, a, _at, _w, _d) in sb.set_plan(
+                       ld["story"], ld["files"], n, {}, fps)["actions"]})
+    if not want:
+        log("  SKIP: the story names no per-set actions")
+        return
+    tmp = tempfile.mkdtemp(prefix="twverify")
+    before_sha = _sha(repo_blend)
+    try:
+        for fn in sorted(os.listdir(HERE)):
+            src = os.path.join(HERE, fn)
+            if os.path.isfile(src) and fn.endswith((".py", ".yml", ".srt",
+                                                    ".json", ".blend")):
+                shutil.copy2(src, tmp)
+            elif os.path.isdir(src) and fn in ("subtitles", "audio"):
+                shutil.copytree(src, os.path.join(tmp, fn))
+        with open(os.path.join(tmp, "_verify_fp.py"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(FP_SCRIPT)
+        blend = os.path.join(tmp, "talking_robots.blend")
+        fp = {t: os.path.join(tmp, "fp_%s.json" % t)
+              for t in ("before", "after")}
+        xvfb = shutil.which("xvfb-run")
+        ui = ([xvfb, "-a", "-s", "-screen 0 1280x800x24", exe] if xvfb
+              else [exe])
+
+        def run(args, env=None, label=""):
+            e = dict(os.environ)
+            e.update(env or {})
+            r = subprocess.run(args, cwd=tmp, env=e, capture_output=True,
+                               text=True, timeout=1800)
+            if r.returncode != 0:
+                log("  child failed (%s, exit %d): %s"
+                    % (label, r.returncode,
+                       (r.stdout or "")[-700:] + (r.stderr or "")[-400:]))
+            return r.returncode, (r.stdout or "")
+
+        rc, out = run(ui + ["-b", blend, "-P", "_verify_fp.py"],
+                      {"TW_FP_OUT": fp["before"], "TW_TWEAK": want[0]},
+                      "fingerprint + hand tweak")
+        check(rc == 0, "fingerprint + hand tweak on '%s' exits 0"
+              % want[0], rc)
+        check("[FP] saved the tweak" in out, "the tweaked copy was saved (so "
+              "the rebuild really had hand edits to keep)", out[-160:])
+        rc, out = run(ui + ["-b", blend, "-P", "build_scene.py"], None,
+                      "additive rebuild")
+        check(rc == 0, "build #2 (additive rebuild over the tweaked file) "
+                       "exits 0", rc)
+        check("SAVED " in out, "the rebuild really ran and saved the copy",
+              out[-160:].replace("\n", " | "))
+        rc, out2 = run(ui + ["-b", blend, "-P", "_verify_fp.py"],
+                       {"TW_FP_OUT": fp["after"]}, "fingerprint")
+        check(rc == 0, "second fingerprint exits 0", rc)
+        check("Traceback" not in out + out2, "no child printed a traceback",
+              [l for l in (out + out2).splitlines() if "Traceback" in l][:1])
+        if not all(os.path.isfile(p) for p in fp.values()):
+            check(False, "both fingerprints were written")
+            return
+        b = json.load(open(fp["before"], encoding="utf-8"))
+        a = json.load(open(fp["after"], encoding="utf-8"))
+        check(_sha(repo_blend) == before_sha,
+              "the proof never touched the repo's own .blend", "same sha256")
+        moved = sorted(n for n in sorted(set(b["actions"]) & set(a["actions"]))
+                       if b["actions"][n]["digest"]
+                       != a["actions"][n]["digest"])
+        check(not moved, "no action key changed across the rebuild (the "
+                         "hand tweak survived on all %d)" % len(b["actions"]),
+              moved)
+        check(sorted(b["actions"]) == sorted(a["actions"]),
+              "the rebuild created no extra action and dropped none",
+              (len(b["actions"]), len(a["actions"])))
+        check(b["objects"] == a["objects"],
+              "no duplicate objects after the rebuild (.001 names)",
+              [o for o in a["objects"] if o not in b["objects"]][:5])
+        check(b["meshes"] == a["meshes"] and b["materials"] == a["materials"],
+              "no duplicate mesh/material blocks after the rebuild")
+        check(b["uids"] == a["uids"],
+              "_tw_uid stamps are stable across the rebuild",
+              len(a["uids"]))
+        check(b["frames"] == a["frames"],
+              "the frame range survived the rebuild",
+              (b["frames"], a["frames"]))
+        setacts = sorted(n for n in a["actions"] if "__" in n)
+        check(setacts == want,
+              "the file holds exactly the %d per-set actions story.yml names"
+              % len(want), sorted(set(setacts) ^ set(want)))
+        check(all(a["actions"][n]["fake_user"] for n in setacts),
+              "every per-set action is fake-user guarded after the rebuild")
+        side = sb.load_sidecar(
+            sb.sync_path_for(os.path.join(tmp, "story.yml")))
+        check(all(a["actions"][n]["range"] == side["actions"][n]
+                  for n in setacts if n in side["actions"]),
+              "live ranges still match the sidecar after the rebuild",
+              {n: [a["actions"][n]["range"], side["actions"].get(n)]
+               for n in setacts
+               if n in side["actions"]
+               and a["actions"][n]["range"] != side["actions"][n]})
+        log("  %d action(s) fingerprinted twice, %d object(s), %d uid(s)"
+            % (len(a["actions"]), len(a["objects"]), len(a["uids"])))
+    except Exception as ex:
+        # A sandbox without a re-executable Blender or a spare 2 GB of RAM is
+        # not a reason to call the build broken: say so and carry on.
+        log("  SKIP: build-twice could not run here (%r)" % (ex,))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -217,11 +439,114 @@ def main():
     check(scene.tw_preview_set == start, "start set re-armed after probing",
           scene.tw_preview_set)
 
+    # --- the preview drives the camera like the game does ---------------
+    plan = sb.set_plan(story, loaded["files"], start, dict(side["actions"]),
+                       mod.scene_fps(scene))
+    cam = scene.camera
+    shots = plan["shots"]
+    check(len(shots) >= 2, "the start set has cuts to follow",
+          [s[1] for s in shots])
+    fps = max(float(mod.scene_fps(scene)), 1e-6)
+    f0 = int(scene.frame_start)
+    j = next((i for i in range(1, len(shots))
+              if shots[i][1] != shots[0][1]), None)
+    check(j is not None, "the start set cuts to a DIFFERENT shot",
+          [sh[1] for sh in shots])
+    if j is None:
+        j = 1                        # keep going: the checks below will report
+    fps = max(float(mod.scene_fps(scene)), 1e-6)
+    f0 = int(scene.frame_start)
+
+    def of(obj_name):
+        o = bpy.data.objects[obj_name]
+        return (tuple(round(v, 5) for v in o.matrix_world.translation),
+                round(float(o.data.lens), 5))
+
+    def eased(k):
+        """What smoothstep(k) between the two shots must give (independent)."""
+        a, b = of(shots[0][1]), of(shots[j][1])
+        kk = k * k * (3.0 - 2.0 * k)
+        return (tuple(round(a[0][i] + (b[0][i] - a[0][i]) * kk, 5)
+                      for i in range(3)), round(a[1] + (b[1] - a[1]) * kk, 5))
+
+    def pose():
+        return (tuple(round(v, 5) for v in cam.matrix_basis.translation),
+                round(float(cam.data.lens), 5))
+
+    def at(t):
+        scene.frame_set(f0 + int(round(t * fps)))
+        return pose()
+
+    open_p = at(shots[0][0])
+    mid_p = at(shots[j][0] + mod.CAM_BLEND / 2.0)
+    cut_p = at(shots[j][0] + mod.CAM_BLEND + 0.1)
+    check(open_p == of(shots[0][1]), "preview holds the set's opening shot",
+          "%s vs %s" % (open_p, of(shots[0][1])))
+    check(cut_p == of(shots[j][1]), "the cut re-frames the camera (no bake)",
+          "%s vs %s" % (cut_p, of(shots[j][1])))
+    check(mid_p == eased(0.5), "the move is eased with the game's smoothstep",
+          "%s vs %s" % (mid_p, eased(0.5)))
+    check(mid_p not in (open_p, cut_p), "mid-move is neither end pose", mid_p)
+    check(not mod.preview_camera_tick(scene),
+          "the tick is idempotent (a correct pose writes nothing)")
+    # reproducible: re-visiting the same frames lands on the same pose
+    cut_t = shots[j][0] + mod.CAM_BLEND + 0.1
+    check(at(shots[0][0]) == open_p and at(cut_t) == cut_p
+          and at(cut_t) == cut_p, "the follow is a pure function of t "
+                                  "(scrub + render reproducible)")
+    # out of the previewed range: the camera is left alone
+    scene.frame_set(int(scene.frame_end) + 3)
+    bpy.context.view_layer.update()
+    check(pose() == cut_p, "outside the set range the camera is not driven",
+          pose())
+    scene.frame_set(f0 + int(round((shots[j][0] + mod.CAM_BLEND + 0.1) * fps)))
+    # hand-authored camera keys always win (the same rule the menu uses)
+    ad = cam.animation_data or cam.animation_data_create()
+    keep = bpy.data.actions.new("__verify_cam_keys")
+    ad.action = keep
+    ad.action_slot = mod._slot_for(keep, cam)
+    cam.location = (12.0, -34.0, 5.0)
+    cam.keyframe_insert("location", frame=f0)
+    cam.keyframe_insert("location", frame=int(scene.frame_end))
+    scene.frame_set(f0 + 40)
+    bpy.context.view_layer.update()
+    check(abs(cam.matrix_basis.translation.x - 12.0) < 1e-4
+          and not mod.preview_camera_tick(scene),
+          "hand-authored camera keys beat the follow", pose())
+    ad.action = None
+    bpy.data.actions.remove(keep)
+    check(at(shots[j][0] + mod.CAM_BLEND + 0.1) == cut_p,
+          "removing the hand keys gives the follow back")
+    # the checkbox hands the camera back
+    cam.matrix_basis.translation = (1.0, 2.0, 3.0)
+    cam.data.lens = 33.0
+    scene.tw_preview_camera = False
+    at(shots[0][0])
+    at(shots[j][0])
+    check(pose() == ((1.0, 2.0, 3.0), 33.0),
+          "the checkbox alone stops every camera write", pose())
+    scene.tw_preview_camera = True
+    ok, msgs = mod.clear_preview_impl(scene)
+    check(ok and scene.tw_preview_set == start and not scene.tw_preview_camera,
+          "Leave Preview re-arms the start set and stops the follow",
+          "; ".join(msgs)[:120])
+    cam.matrix_basis.translation = (4.0, 5.0, 6.0)
+    at(shots[j][0])
+    check(pose() == ((4.0, 5.0, 6.0), pose()[1]),
+          "after Leave Preview the camera is really yours", pose())
+    mod.preview_set_impl(scene, start)
+    check(scene.tw_preview_set == start and len(sub.tw_entries) ==
+          len(sb.set_plan(story, loaded["files"], start, dict(side["actions"]),
+                          mod.scene_fps(scene))["subs"]),
+          "the scene is left in the start-set state")
+
     # --- the generic per-object export the add-on writes ------------------
     check(len(gd.game.properties) >= 1 if gd else False,
           "director properties hold paths only",
           json.dumps({k: len(str(gd.game.properties[k].value))
                       for k in gd.game.properties.keys()}) if gd else "-")
+
+    build_twice()
 
     print("VERIFY summary: %d ok, %d failed" % (len(OK), len(FAIL)))
     for f in FAIL:
