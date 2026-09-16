@@ -391,11 +391,10 @@ FOR THIS repo — do not "unify" them without the user.
   be deleted (PR #1 closed) — nothing else in them is worth taking: see
   "Checked and rejected" above.
 - The v1.9.1 merge is four commits (`63eced1` addon, `043df84` verify,
-  `35f26b0` tooling + the regenerated `v2_main_0200.png`, then docs). As
-  of writing they are LOCAL ONLY — the sandbox has no push credential, so
-  `git push` still has to happen (with a fresh PAT from the user, via a `/tmp`
-  askpass helper). If they are gone from `origin/main`, that is the step that
-  was never taken.
+  `35f26b0` tooling + the regenerated `v2_main_0200.png`, then docs), pushed as
+  `cbb8e65..ea952a0` on `main`. This sandbox holds no credential between turns,
+  so any later push needs a fresh PAT from the user (write the askpass helper to
+  `/tmp`, `chmod 700`, delete it right after, and never put it in a remote URL).
 - `git merge` was deliberately not used for that: every one of their three
   files (`build_scene.py`, `verify_game.py`, `typewriter_subtitles.py`) is a
   rival rewrite of main's verified version, so a merge would have regressed the
