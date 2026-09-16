@@ -4,18 +4,80 @@ For the next agent session. Read this first, then `README.md`, then `story.yml`.
 
 ## What this repo is
 
-- `typewriter_subtitles.py` — Blender add-on **v1.9.0**: timeline-keyed 3D
-  typewriter subtitles **+ v2 story tools** (Preview Set, Refresh Sync,
-  rename watch, validator, per-set bake).
+- `typewriter_subtitles.py` — Blender add-on **v1.9.1**: timeline-keyed 3D
+  typewriter subtitles **+ v2 story tools** (Preview Set + the game-parity
+  preview camera follow, Leave Preview, Refresh Sync, rename watch, validator,
+  per-set bake).
 - `story.py` + `story.yml` + `*.srt` + `story.sync.json` +
   `story.schema.json` — the animation-centric story engine (sets of
   animations, choices, loops) + shared parser/validation/rewrite helpers.
 - `game_subtitles.py` — UPBGE game driver (Module: `game_subtitles.update`).
 - `build_scene.py` / `resave_game.py` / `verify_game.py` — headless pipeline.
+- `make_stills.py` — renders `test/*.png` **and** verifies the committed ones
+  pixel-for-pixel (`MODE=noaddon|addon|sets|camera`, `OVERWRITE=1` to accept).
+- `test_panel_draw.py` — drives the panel `draw()` in a fake layout (the only
+  test that reaches the UI code).
 - `talking_robots.blend` — the demo scene (two robot actors, staged shot cams).
 - Target engine: **UPBGE 0.50 (Blender 5.0.1)**, Linux x64.
 
-## Current state (2026-09-15): v2 migration DONE, verified except on a GPU
+## Current state (2026-09-16): v2 done, side branches merged, verified except on a GPU
+
+### Merged from `dev-v2` + `v2-migration` (both branched off `6ccdb28`, the
+same base as main, and each re-implemented the same 5 queued items)
+
+Main was already the superset for the *pipeline*; what these two branches still
+had that was worth taking, and what was deliberately **not** taken:
+
+**Taken**
+- `dev-v2`: the **per-frame preview camera follow** (`preview_camera_tick`,
+  `camera_pose_at`, `_mat_close`, `_mtime_of`): poses the render camera as a
+  pure function of the frame from the previewed set's shots, with the game's
+  0.5 s smoothstep. Main only snapped the opening shot, so a scrubbed timeline
+  or a render showed one framing while the game cut. Gated on a new
+  `Scene.tw_preview_camera` checkbox, restricted to the previewed range, and it
+  steps aside when the camera has its own action (same rule as the menu).
+  Rewired to run from `frame_change_post` + `load_post` **only** — the
+  depsgraph site was dropped on purpose, or editing any object would snap the
+  view back under the mouse.
+- `v2-migration`: `make_stills.py` (proof stills as a committed script instead
+  of a `/tmp` throwaway), `test_panel_draw.py` (headless `draw()` test), and the
+  **build-twice fingerprint proof** inside `verify_game.py` (a hand tweak to a
+  generated action's keys, then a rebuild in a throwaway copy of the project,
+  then a digest comparison — plus the "the repo's own .blend was untouched"
+  sha256 assertion). Main had the same idea as a scratch script that does not
+  survive a snapshot.
+- `v2-migration`: slot binding hardening — prefer `action_suitable_slots`, then
+  the slot named `OB<name>`, then a slot with the right identifier prefix, and
+  only then create one. In 5.0.1 `ActionSlot.id_type` does **not** exist (use
+  the `identifier` prefix) but `AnimData.action_suitable_slots` does and is what
+  keeps a shape-key (`ME…`) slot from being bound to an object.
+- `v2-migration` docs: three gotchas main had not written down (below:
+  `open_mainfile` segfault, `Matrix.identity()`, animated-vs-rest-pose proofs).
+
+**Checked and rejected** (all three verified against this build, not assumed)
+- Their `_load_sound` / speaker-dedupe helpers iterate `bpy.data.sounds` and
+  call `bpy.data.sounds.load()` — **that API is gone in Blender 5**, so the
+  helper silently returns `None`. Main's `strips.new_sound` path is the one that
+  works.
+- Their `promote_sidecar_names` (re-record uid names after a rename so Apply does
+  not immediately re-report it) duplicates main's `rewrite_story_refs` →
+  `refresh_sync_impl` call.
+- `TW_OT_jump_to_set` just called `preview_set_impl` (the marker op was deleted
+  in v2 on purpose), `TW_OT_bake_set` re-exposed the per-set bake prefix the
+  Preview Set already owns, and `TW_OT_clear_preview` there *cleared*
+  `tw_preview_set`, which would hide every baked line and blank the render —
+  main's version re-arms the start set instead and only switches the follow off.
+- Their `VIEW3D_PT_tw_story` panel + `_fill_report` report box: main already
+  shows the same text lists in the Story box (and the veto on graph UI is
+  respected in both).
+- Their `test/` re-adds the v1 stills (`br_*`, `fx_*`, `st_*`, `v8*`, `test_*`)
+  that show the deleted marker / baked-camera pipeline; their `.blend`, `.mp4`
+  and README/HANDOFF rewrites are rival versions of the same work and are
+  *behind* main (no `diff_uids`/`rewrite_refs`/`sidecar_payload` in `story.py`,
+  no `test_addon_story.py` in `dev-v2`, fewer verify checks).
+  Nothing is left in either branch that main does not have; both can be deleted.
+
+### The five queued items this all came from
 
 The v1 master-timeline pipeline (single `dialogue.srt`, absolute frames, one
 baked `Camera_anim`, one choice) is fully replaced by the v2 animation-centric
@@ -51,7 +113,8 @@ pipeline. All five queued items from the last handoff are done:
 3. **resave_game.py v2** — v2 story validation + `check_bindings` before it
    saves, sidecar refresh, generic-path self-test, keeps the no-`Text`-write
    rule.
-4. **verify_game.py v2** — **86 checks, 0 failures** on the shipped .blend
+4. **verify_game.py v2** — **117 checks, 0 failures** on the shipped .blend
+   (was 86; +15 preview-camera checks, +16 build-twice/idempotency checks)
    (story clean, sidecar present + ranges == live keys, uids cover every
    reference, bindings vs scene, per-set fake users, frame range = start set,
    no markers, camera unbaked, baked `<set>_Line##` per previewed set, menu
@@ -67,7 +130,11 @@ diff_uids / rewrite_refs / sidecar write), `test_game_logic.py`,
 `test_tw_game.py`, `test_addon_story.py` (NEW, runs inside Blender: check,
 Refresh Sync, both previews, per-set bake, rename→Apply, auto-rewrite, camera
 rename→`[CAM]` in .srt, refuses to rewrite a broken story),
-`test_persistence.py` (MODE=A), `test_load_repair.py`, `test_ops.py`.
+`test_persistence.py` (MODE=A/B/C/R), `test_load_repair.py`, `test_ops.py` (all
+against `persist_A.blend` — it needs the `SubTest` object that mode A creates),
+and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified).
+`make_stills.py` reproduces all 9 committed stills byte-for-byte in IDAT terms
+(pixel-identical); re-running it is the media regression check.
 
 ## Still open / known gaps (pick from here)
 
@@ -90,8 +157,16 @@ rename→`[CAM]` in .srt, refuses to rewrite a broken story),
   pipeline). Re-render them only as v2 frames.
 - The old `talking_robots_timeline.mp4` (v1, push-in + cuts) was replaced by a
   start-set-only render; a "whole story" video needs the game capture, not the
-  timeline.
+  timeline. It was rendered **without** the add-on, so it holds each set's
+  opening framing: with v1.9.1 the same command (step 4 in README, which passes
+  `register_addon.py`) also cuts between shots — re-rendering it is ~40 min of
+  2-vCPU Cycles for 361 frames and nothing else in the repo depends on it.
+  `test/v2_cam_hold.png` vs `v2_cam_follow.png` is the cheap proof.
 - `inspect_bricks.py`, `resave_with_backup.py` are v1 leftovers, unused.
+- `verify_game.py`'s build-twice proof needs a re-executable Blender
+  (`bpy.app.binary_path`) and ~2 spare GB; it skips (loudly, with a `SKIP` log
+  line, not a failure) otherwise, and `TW_SKIP_BUILD_TWICE=1` skips it on
+  purpose. On this box all four child runs cost ~3 s.
 
 ## Locked design decisions (do not relitigate without the user)
 
@@ -126,73 +201,50 @@ timeout 600 xvfb-run -a -s "-screen 0 1280x800x24" $U/blender --factory-startup 
 timeout 300 xvfb-run -a -s "-screen 0 1280x800x24" $U/blender talking_robots.blend -P resave_game.py
 $U/blender -b talking_robots.blend -P verify_game.py
 $U/blender -b --factory-startup -P test_addon_story.py
+$U/blender -b talking_robots.blend -P test_panel_draw.py     # panel draw states
+$U/blender -b --factory-startup -P test_persistence.py        # MODE=A first
+MODE=B $U/blender -b persist_A.blend -P test_persistence.py   # no add-on
+MODE=C $U/blender -b persist_B.blend -P test_persistence.py   # repair on load
+MODE=R $U/blender -b persist_A.blend -P test_persistence.py   # rebuild/recover
+$U/blender -b persist_A.blend -P test_load_repair.py         # needs SubTest
+$U/blender -b persist_A.blend -P test_ops.py                 # ditto
+$U/blender -b talking_robots.blend -P make_stills.py         # render + verify
 $U/blender -b talking_robots.blend -P register_addon.py -o //test/xa_ -f 30   # +addon
 $U/blender -b talking_robots.blend -o //test/x_ -f 30                        # no addon
+rm -f persist_*.blend && git status --short                   # scratch cleanup
 ```
 
-`/tmp/reg_addon.py` (recreate, /tmp does not persist; point it at the repo):
+`test_persistence.py` MODE=A writes `persist_A.blend` **in the repo dir** and
+(the load/save handlers fire) used to rewrite `story.sync.json` from that
+scratch scene; the guard in `write_sync_files` is what stops that now — check
+`git status` after the persistence chain anyway. `register_addon.py` is
+committed for one-off background renders (`/tmp` scripts do not survive a
+snapshot, which is why `make_stills.py` exists).
 
-```python
-import sys; sys.path.insert(0, "/home/user/upbge-subs")   # repo root
-import typewriter_subtitles as tw; tw.register()
-```
+Idempotency / no-clobber proof: **committed in `verify_game.py`** as
+`build_twice()` (merged from `v2-migration`, which is how it was proven there
+instead of in a throwaway script). It copies the project to a temp dir, nudges
+every inner key of the story's first per-set action and saves, re-runs
+`build_scene.py` over that file, then compares an action-key fingerprint
+(digest + counts + `_tw_uid` stamps + frame range + fake users + ranges vs the
+sidecar) and asserts the repo's own `.blend` kept the same sha256. Skip it with
+`TW_SKIP_BUILD_TWICE=1`; it also skips itself (with a `SKIP` line, not a failure)
+when `bpy.app.binary_path` or `xvfb-run` is unavailable. Last full run:
+**117 ok / 0 failed**, and the rebuild left all 21 actions untouched.
 
-Idempotency check (a rebuild must never lose keys or duplicate bricks):
-snapshot per-action keyframe counts + object/baked/brick counts, rebuild over
-the saved file, then compare. Last run on the shipped files: IDENTICAL
-(21 actions, 8 baked objects, 54 objects, 1 sensor, 1 controller) - and it is
-what caught gotchas 10 and 11. The script:
+The older manual version of that check (per-action key counts before/after a
+rebuild, then `diff`) still works if you want to eyeball it: snapshot
+`{action: sum(len(kf))}` from `a.layers → strips → channelbags → fcurves`,
+rebuild with `xvfb-run $U/blender talking_robots.blend -P build_scene.py`,
+snapshot again, compare. It reported IDENTICAL (21 actions, 8 baked objects,
+54 objects, 1 sensor, 1 controller) and it is what caught gotchas 10 and 11.
 
-```bash
-cat > /tmp/keycount.py <<'PY'
-import bpy, json, os
-out = {}
-for a in bpy.data.actions:
-    out[a.name] = sum(len(fc.keyframe_points) for L in a.layers
-                      for s in L.strips for cb in s.channelbags
-                      for fc in cb.fcurves)
-out["__objects"] = len(bpy.data.objects)
-out["__baked"] = len([o for o in bpy.data.objects if "_Line" in o.name])
-out["__sensors"] = len(bpy.data.objects["GameDirector"].game.sensors)
-out["__controllers"] = len(bpy.data.objects["GameDirector"].game.controllers)
-out["__frames"] = "%d-%d" % (bpy.context.scene.frame_start,
-                             bpy.context.scene.frame_end)
-out["__markers"] = len(bpy.context.scene.timeline_markers)
-open("/tmp/count_%s.json" % os.environ.get("TAG", "x"), "w").write(
-    json.dumps(out, indent=1, sort_keys=True))
-print("COUNTS written", flush=True)
-PY
-U=/home/user/upbge/upbge-0.50-linux-x64
-TAG=before $U/blender -b talking_robots.blend -P /tmp/keycount.py
-xvfb-run -a -s "-screen 0 1280x800x24" \
-    $U/blender talking_robots.blend -P build_scene.py     # additive refresh
-TAG=after $U/blender -b talking_robots.blend -P /tmp/keycount.py
-diff /tmp/count_before.json /tmp/count_after.json && echo IDENTICAL
-```
-
-Stills: `test/` now holds v2 frames only (the v1 `br_*`/`fx_*`/`st_*`/`v8*`
-shots were dropped - they showed the removed markers + baked-camera pipeline).
-A single set-preview frame comes from `preview_set_impl` + one frame render:
-
-```bash
-cat > /tmp/still.py <<'PY'
-import bpy, os, sys
-sys.path.insert(0, "/home/user/upbge-subs")
-import typewriter_subtitles as tw
-if not hasattr(bpy.types.Object, "tw_entries"):
-    tw.register()
-SET = os.environ.get("STILL_SET", "")
-if SET:
-    ok, msgs = tw.preview_set_impl(bpy.context.scene, SET)
-    print("[STILL]", SET, ok, "; ".join(msgs)[:120], flush=True)
-    bpy.context.scene.frame_set(min(30, bpy.context.scene.frame_end))
-    bpy.context.view_layer.update()
-# no quit_blender(): a -b run exits on its own (and must not before -f)
-PY
-STILL_SET=cuby $U/blender -b talking_robots.blend -P /tmp/still.py \
-    -o //test/v2_cuby_ -F PNG -f 30
-```
-
+Stills: `test/` holds v2 frames only (the v1 `br_*`/`fx_*`/`st_*`/`v8*`
+shots were dropped — they showed the removed markers + baked-camera pipeline,
+and both side branches still carry them). `make_stills.py` renders every one of
+them and compares the result with the committed file, so a still can never rot
+silently; `MODE=camera` is the preview camera follow pair, `OVERWRITE=1` accepts
+a deliberate change (read the two PNGs first - see gotcha 27).
 
 ## Gotchas (earned the hard way — respect all of them)
 
@@ -282,6 +334,40 @@ STILL_SET=cuby $U/blender -b talking_robots.blend -P /tmp/still.py \
     explicit **Refresh Sync** button always writes (user intent). `test_addon_
     story.py` section 10 pins both directions.
 
+22. **Never `bpy.ops.wm.open_mainfile()` inside a UI session** on UPBGE 0.50:
+    it segfaults at teardown (open + quit with nothing between exits 139) and a
+    later `bpy.ops.object.game_property_new` hangs. Loading the same file as a
+    command-line ARGUMENT is clean — which is why `verify_game.build_twice`
+    re-execs with `bpy.app.binary_path`, **not** `sys.executable` (under UPBGE
+    that is the bundled python, which tries to run the `.blend` as a script).
+    (from `v2-migration`'s HANDOFF)
+23. `Matrix.identity()` mutates in place and returns `None` — never assign its
+    result. (also from `v2-migration`)
+24. Comparing an animated value against the **rest pose** is a weak evaluation
+    proof: an idle bob can be exactly `sin(36*pi) == 0` at its last frame.
+    Compare the evaluated depsgraph value against what the ACTION keys say at
+    that frame. (also from `v2-migration`)
+25. A preview camera tick must **not** be wired into `depsgraph_update_post`.
+    It writes the camera, so the depsgraph re-fires; converged by an epsilon
+    compare, but any unrelated edit would still snap the camera back to the
+    shot. `frame_change_post` + `load_post` is enough (and the reason
+    `preview_camera_tick` returns False right after a `frame_set`: the handler
+    already posed it — assert on the **pose**, not the return value, or you get
+    a test that fails while the code is right; that is exactly how the first
+    version of `test_addon_story.py` section 11 read).
+26. Two more Blender 5.0.1 API facts, both hit while merging:
+    `ActionSlot.id_type` does not exist (match `slot.identifier` prefixes:
+    `OB`=object, `ME`=mesh/shape-key), and RNA collection elements come back as
+    fresh wrappers, so `action.slots[i] is the_slot` is False — compare with
+    `==`. `Mesh.shape_key_add()` is gone too, so probe slot behaviour without
+    shape keys.
+27. Blender embeds a render timestamp in a PNG `tEXt` chunk, so **file hashes
+    differ for identical pixels**. `make_stills.py` therefore hashes the
+    concatenated `IDAT` payloads (and a whole-image check needs
+    `ffmpeg -lavfi psnr`, where `inf` means identical). Do not "fix" a
+    mismatched still by force-overwriting it: read the two images first —
+    `v2_main_0200.png` legitimately changed because the camera follow now cuts
+    there, which is the feature working, not drift.
 ## Related: UPVN (github.com/SodoMita/UPVN)
 
 Ren'Py-like VN framework for UPBGE (v0.6.x, 391 files, 335 tests): direct
@@ -298,8 +384,23 @@ FOR THIS repo — do not "unify" them without the user.
   never commit tokens; use a `/tmp` askpass helper, never a stored remote URL
   with credentials). Default branch `main`.
 - History: `08c50b9` v1.8.0 talking-robots demo → `6ccdb28` v2 core (parser,
-  driver, content, tests) → this commit (v1.9.0 add-on story tools + v2
-  scene pipeline + docs).
+  driver, content, tests) → `7df54f7..cbb8e65` v1.9.0 add-on story tools + v2
+  scene pipeline + docs → v1.9.1 (this), which merges everything of value out of
+  the two side branches (`dev-v2` 9fffaf7, `v2-migration` 59efed1 = PR #1) that
+  re-implemented the same five queued items. Both are now fully consumed and can
+  be deleted (PR #1 closed) — nothing else in them is worth taking: see
+  "Checked and rejected" above.
+- The v1.9.1 merge is four commits (`63eced1` addon, `043df84` verify,
+  `35f26b0` tooling + the regenerated `v2_main_0200.png`, then docs). As
+  of writing they are LOCAL ONLY — the sandbox has no push credential, so
+  `git push` still has to happen (with a fresh PAT from the user, via a `/tmp`
+  askpass helper). If they are gone from `origin/main`, that is the step that
+  was never taken.
+- `git merge` was deliberately not used for that: every one of their three
+  files (`build_scene.py`, `verify_game.py`, `typewriter_subtitles.py`) is a
+  rival rewrite of main's verified version, so a merge would have regressed the
+  pipeline while resolving. The valuable pieces were ported and re-tested
+  instead.
 - Repo hygiene: `*.blend1`, `persist_*.blend`, `render/`, `capture/`,
   `*debug.log` and `*.tmp` writes are git-ignored; `story.sync.json` and
   `story.schema.json` ARE committed (the game reads the sidecar without the

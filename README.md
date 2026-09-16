@@ -19,7 +19,10 @@ timeline everything else is measured against.
   today: one set, its own frame range `1-361`, its cues typing live on the
   baked per-cue text objects. The shot cuts and the rest of the story are the
   game's business (press **P**) — see [the authoring
-  model](#the-authoring-model-one-scene-one-set-at-a-time).
+  model](#the-authoring-model-one-scene-one-set-at-a-time). Rendered *with*
+  the add-on and a set previewed, the same command now cuts between the staged
+  shots too (v1.9.1); this file predates that, so it holds each set's opening
+  framing throughout.
 - `test/` stills (all from this repo's scene, rendered headless):
   `v2_main_0030/0200/0361.png` — the `main` set typing; `0361` is the set's
   last frame, where the armed choice menu is revealed.
@@ -28,6 +31,13 @@ timeline everything else is measured against.
   `v2_cuby_0030.png` / `v2_sphero_0030.png` — the *other* two sets after
   **Preview Set** (their cues are not baked, so these prove the live-typing
   path plus the per-set action swap).
+  `v2_cam_hold.png` / `v2_cam_follow.png` — frame 105 of `main`, the frame its
+  first real cut has just landed: the wide shot while the camera follow is off,
+  Cuby's close-up with it on (the game does this itself; now a timeline scrub or
+  a render shows it too).
+  All nine are rendered *and verified* by `make_stills.py` — re-running it
+  re-renders each frame and reports `matches the committed still (pixels
+  identical)`, so the media in this repo is reproducible, not just decorative.
 
 ## Play it
 
@@ -118,18 +128,20 @@ Rules worth knowing:
   single-line `[flow, lists]` and `{flow: maps}`, quoted strings, spaces
   (never tabs).
 
-## The add-on (v1.9.0): what the Subtitles panel does
+## The add-on (v1.9.1): what the Subtitles panel does
 
 Select a 3D text object → Sidebar (`N`) → **Subtitles**. Everything from v1 is
 still there (entries + keys, live typing, `Ctrl+Shift+U` to add a line, SRT/VTT
 import/export, the auto-backup + Rebuild/Recover self-heal, Add Game Logic for
-projects without a story). New in v1.9.0 — the **Story sets** box, which works
-with any selection (or none):
+projects without a story). The **Story sets** box (v1.9.0, extended in v1.9.1)
+works with any selection (or none):
 
 | Control | What it does |
 |---|---|
 | `Story File` | Which `story.yml` the tools read (default `//story.yml`, next to the .blend). The game reads its own path from the `tw_story` game property; this one is for the editor. |
 | **Preview `main` / `cuby` / …** | The per-set context switch: that set's cues become the subtitle lines (set-local frames), its `action:` animations get assigned to the actors (action + slot), the render camera snaps to its opening staged shot (lens included), its `end: choice` arms the menu (revealed only over the set's tail), its audio becomes sequencer sound strips, and the frame range becomes the set's length. Other sets' baked `<set>_Line##` objects get hidden (bakes are set-local, so they would stack on top of each other), and live typing mirrors the bake: a baked set lets its baked objects carry the text, an unbaked set types live. It only ever *assigns* or *hides* — no action, key or line of another set is deleted. |
+| `Camera follows the preview` | While a set is previewed, the add-on poses the render camera for *every* frame from that set's shots — the same last-shot-at-or-before-t rule and the same 0.5 s smoothstep ease (position + rotation + lens) the game driver uses, but as a pure function of the frame, so scrubbing and rendering reproduce press **P**. It only runs inside the previewed range, never overwrites camera keys you authored, and writes no animation data. Off = the camera stays where **Preview Set** snapped it. |
+| **Leave Preview** | Back to the story's start set (the state the file is saved in) with the follow switched off, so the camera is yours again. Nothing is deleted. |
 | **Refresh Sync** | Writes `story.sync.json` (every action's keyframe range + the uid map the rename watch needs) and `story.schema.json` (VSCode completion for `story.yml`), and sets a fake user on the story's actions so a purge can't eat them. **Also runs automatically on save**, so the sidecar can never drift from your keys. |
 | **Check** | Validates `story.yml` + every `.srt` it references and cross-checks the object/action/camera names against this scene. Results are plain text lines in the box (no graph UI — that was a deliberate veto). |
 | **Apply to Story** | When you rename a referenced object/action/camera, the panel lists the pending renames; Apply rewrites them **only where they are used as references** (`Obj@Act`, `camera: Shot`, `[CAM Shot]` in the `.srt` files) — labels, set names and prose are untouched, and the write is atomic. `Auto-rewrite refs on rename` applies them the moment they are detected instead. |
@@ -157,7 +169,7 @@ that job (and much more).
 |---|---|
 | `talking_robots.blend` | The scene: stage, robots, per-set actions, staged shot cams, game bricks |
 | `talking_robots_timeline.mp4` | The rendered **start set** (the timeline proof) |
-| `typewriter_subtitles.py` | The add-on (v1.9.0: subtitles + story preview/sync/rename/validation) |
+| `typewriter_subtitles.py` | The add-on (v1.9.1: subtitles + story preview/sync/rename/validation + the preview camera follow) |
 | `story.yml` | The wiring: sets (anims + end), choices, start, cps |
 | `dialogue.srt` / `cuby.srt` / `sphero.srt` | Subtitle text per set (+ `[CAM]` shot lines) |
 | `story.sync.json` | Generated: action frame ranges + the `uid → name` map (refreshed on save) |
@@ -167,14 +179,16 @@ that job (and much more).
 | `tw_game.py` / `test_tw_game.py` | Generic driver for projects *without* a story (embedded by Add Game Logic) + its test |
 | `build_scene.py` | Builds/refreshes the .blend headless (additive: create-if-missing, never deletes keys) |
 | `resave_game.py` | Refreshes the demo's game setup + self-tests the generic path (Xvfb) |
-| `verify_game.py` | Headless wiring check of the .blend (86 checks; never saves) |
+| `verify_game.py` | Headless wiring check of the .blend (117 checks; never saves; includes the build-twice proof) |
 | `register_addon.py` | Registers the add-on for background renders |
+| `make_stills.py` | Renders (and pixel-verifies) the `test/` stills; never saves the .blend |
+| `test_panel_draw.py` | Drives the panel's `draw()` through a fake layout in every state (the UI code no other test reaches) |
 | `set_capture.py`, `autostart_game.py` | Make a `*_capture.blend` that auto-records the game |
 | `test_story.py` | Story/YAML/SRT parsing, plans, sidecar/schema, rewrite, add-on parity |
 | `test_game_logic.py` | Headless unit test for the game driver (sets, choices, loops, capture) |
 | `test_addon_story.py` | In-Blender test of the v2 add-on tools (preview, sync, rename watch, per-set bake) |
 | `test_persistence.py`, `test_ops.py`, `test_load_repair.py` | Recovery/persistence/operator tests (inside Blender) |
-| `test/` | Poster stills |
+| `test/` | Poster stills (reproducible: `make_stills.py`) |
 | `HANDOFF.md` | State + gotchas for the next session — read it before changing anything |
 
 ## Reproduce / re-render (Linux, headless-safe)
@@ -207,9 +221,15 @@ $U/blender -b talking_robots.blend -P register_addon.py -o //render/frame_ -F PN
 ffmpeg -framerate 24 -i render/frame_%04d.png -c:v libx264 -pix_fmt yuv420p \
        -crf 19 talking_robots_timeline.mp4
 
-# 5. a single frame, with and without the add-on (typing vs full-line card)
+# 5. the proof stills: renders them AND verifies the committed ones match
+$U/blender -b talking_robots.blend -P make_stills.py
+OVERWRITE=1 $U/blender -b talking_robots.blend -P make_stills.py   # accept drift
+MODE=camera $U/blender -b talking_robots.blend -P make_stills.py   # just one
+$U/blender -b talking_robots.blend -P test_panel_draw.py           # panel draw
+
+# 5b. a single frame by hand, with and without the add-on
 $U/blender -b talking_robots.blend -o //test/noaddon_ -F PNG -f 30
-$U/blender -b talking_robots.blend -P /tmp/reg_addon.py -o //test/addon_ -F PNG -f 30
+$U/blender -b talking_robots.blend -P register_addon.py -o //test/addon_ -F PNG -f 30
 
 # 6. headless game capture (needs a GPU; won't run on software GL)
 $U/blender -b talking_robots.blend -P set_capture.py
