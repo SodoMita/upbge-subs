@@ -25,7 +25,7 @@ For the next agent session. Read this first, then `README.md`, then `story.yml`.
   `run_live_newton.sh`; poster stills in `docs/newton_law*.png`.
 - Target engine: **UPBGE 0.50 (Blender 5.0.1)**, Linux x64.
 
-## Current state (2026-09-16): v2 done, side branches merged, verified except on a GPU
+## Current state (2026-09-16): v2 done, all side branches consumed (PR #2), verified on a fresh box
 
 ### Merged from `dev-v2` + `v2-migration` (both branched off `6ccdb28`, the
 same base as main, and each re-implemented the same 5 queued items)
@@ -146,6 +146,15 @@ stdlib suites + `test_addon_story` + persistence A/B/C/R + `test_load_repair`
 and the Newton physics bake prints all three laws with the documented
 numbers. Live captures committed as `docs/game_live_0150.png` /
 `game_live_0450.png` (talking robots) and `docs/newton_live_*.png` (Newton).
+Re-verified on a fresh sandbox after the `agent/newton-mechanics` merge
+(PR #2, main `96c0aea`, 2026-09-16): env rebuilt with `install_env.sh`,
+then the whole chain green - four stdlib suites, `verify_game.py`
+117 ok / 0 failed (incl. build-twice), `test_addon_story`,
+`test_panel_draw`, persistence A/B/C/R, `test_load_repair`, `test_ops`,
+all 9 stills pixel-identical, Newton bake all three laws with the
+documented numbers, and both live captures re-run on the sway stack
+(talking robots: full loop, 886 captures, backstop quit; Newton smoke
+PASS: 5 sets, 55 watch lines, 91 captures).
 
 ## Still open / known gaps (pick from here)
 
@@ -194,7 +203,10 @@ numbers. Live captures committed as `docs/game_live_0150.png` /
   talking-robots story ran on the unpatched UI path with a null sink:
   actors moved — `playAction` by name works with multi-action objects,
   so no fallback is needed — choices auto-picked, 1800-tick backstop
-  fired, process exited on its own). The user's own Newton harness
+  fired, process exited on its own). Cosmetic: `endGame()` is deferred by
+  the engine until frame end, so the "capture budget hit, quitting" line
+  repeats a few ticks after the budget before the exit lands (bounded;
+  not a bug). The user's own Newton harness
   also passes on this stack (`REBUILD=1 ... sh tools/run_live_newton.sh`
   with the stack's DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR: 5 sets, 55 watch
   lines, 92 captures — note `newton_capture.blend` is git-ignored, so
@@ -218,7 +230,8 @@ numbers. Live captures committed as `docs/game_live_0150.png` /
   `register_addon.py`) also cuts between shots — re-rendering it is ~40 min of
   2-vCPU Cycles for 361 frames and nothing else in the repo depends on it.
   `test/v2_cam_hold.png` vs `v2_cam_follow.png` is the cheap proof.
-- `inspect_bricks.py`, `resave_with_backup.py` are v1 leftovers, unused.
+- `inspect_bricks.py` and `resave_with_backup.py` (v1 leftovers, zero
+  references) were deleted 2026-09-16.
 - `verify_game.py`'s build-twice proof needs a re-executable Blender
   (`bpy.app.binary_path`) and ~2 spare GB; it skips (loudly, with a `SKIP` log
   line, not a failure) otherwise, and `TW_SKIP_BUILD_TWICE=1` skips it on
@@ -287,9 +300,9 @@ numbers. Live captures committed as `docs/game_live_0150.png` /
 ## Commands
 
 ```bash
-cd /home/user/talking_robots
+cd <repo root>
 python3 test_story.py && python3 test_game_logic.py && python3 test_tw_game.py
-U=/home/user/upbge/upbge-0.50-linux-x64
+U=/opt/upbge-0.50-linux-x64
 # --- software-GL proof stack (no GPU, no pre-existing display; Debian) ---
 sudo bash install_env.sh                        # apt + UPBGE 0.50 -> /opt + audio patch + swap
 $U/blender -b talking_robots.blend -P set_capture.py     # CAPTURE as a GAME property
@@ -352,12 +365,14 @@ a deliberate change (read the two PNGs first - see gotcha 27).
    (bisected over ~10 probes). Create/read OK; the game driver rewrites values
    every tick via the KX path (safe). `tw_story` is a *String* prop — assigning
    it is fine.
-2. **Env amnesia:** `/home/user/upbge`, `xvfb`, `libpulse0`, `ffmpeg` vanish on
-   snapshot restore. Reinstall: `sudo apt-get update && sudo apt-get install
-   -y xvfb libpulse0 ffmpeg` (the `update` is required or ffmpeg's deps 404),
-   then redownload `upbge-0.50-linux-x64.tar.xz` from
-   github.com/UPBGE/upbge/releases (tag v0.50, ~408 MB, unpacks to
-   `upbge-0.50-linux-x64/`).
+2. **Env amnesia:** `/opt/upbge-0.50-linux-x64`, `xvfb`, `libpulse0`,
+   `ffmpeg` vanish on snapshot restore. Rebuild everything with
+   `sudo bash install_env.sh` (apt packages + UPBGE 0.50 -> /opt +
+   3D-audio patch + 6 G swapfile). Manual path if you only need part of it:
+   `sudo apt-get update && sudo apt-get install -y xvfb libpulse0 ffmpeg`
+   (the `update` is required or ffmpeg's deps 404), then redownload
+   `upbge-0.50-linux-x64.tar.xz` from
+   github.com/UPBGE/upbge/releases (tag v0.50, ~408 MB) into `/opt`.
 3. **Never two edits to the SAME file in one parallel block** — the merge
    corrupts (duplicated tail observed). Batch across different files only.
    Prefer `python3 - <<'EOF'` patch scripts with an `assert count == 1` on

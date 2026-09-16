@@ -249,7 +249,7 @@ $U/blender -b newton_laws.blend -P tools/make_newton_capture.py  # live-smoke va
 
 ```bash
 cd ~/talking_robots                    # wherever you cloned this repo
-U=/home/user/upbge/upbge-0.50-linux-x64   # UPBGE 0.50 (Blender 5.0.1)
+U=/opt/upbge-0.50-linux-x64                # UPBGE 0.50 (Blender 5.0.1); `sudo bash install_env.sh` puts it there
 
 # 0. headless tests (no Blender needed)
 python3 test_story.py && python3 test_game_logic.py && python3 test_tw_game.py
