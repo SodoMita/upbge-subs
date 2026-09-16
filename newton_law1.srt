@@ -1,0 +1,15 @@
+1
+00:00:00,500 --> 00:00:03,200
+CUBY: Law one: inertia.
+
+2
+00:00:03,400 --> 00:00:06,400
+SPHERO: A puck at rest stays at rest...
+
+3
+00:00:06,600 --> 00:00:08,600
+...until the pusher applies a force.
+
+4
+00:00:08,800 --> 00:00:11,400
+CUBY: Now no net force: it glides at constant speed!

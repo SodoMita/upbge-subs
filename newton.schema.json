@@ -1,0 +1,144 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "properties": {
+    "choices": {
+      "patternProperties": {
+        "^.+$": {
+          "additionalProperties": false,
+          "properties": {
+            "options": {
+              "items": {
+                "maxItems": 3,
+                "minItems": 3,
+                "prefixItems": [
+                  {
+                    "description": "key 1-9"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "enum": [
+                      "intro",
+                      "law1",
+                      "law2",
+                      "law3",
+                      "outro"
+                    ],
+                    "type": "string"
+                  }
+                ],
+                "type": "array"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "prompt": {
+              "description": "cue ref in newton_intro.srt, newton_law1.srt, newton_law2.srt, newton_law3.srt, newton_outro.srt",
+              "pattern": "^\\S+#\\d+$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt",
+            "options"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "cps": {
+      "exclusiveMinimum": 0,
+      "type": "number"
+    },
+    "sets": {
+      "patternProperties": {
+        "^.+$": {
+          "additionalProperties": false,
+          "properties": {
+            "anims": {
+              "items": {
+                "anyOf": [
+                  [
+                    {
+                      "description": "subs: file.srt#a-b | action: Obj@Act | camera: Shot | audio: file.ogg",
+                      "pattern": "^(subs|action|camera|audio):\\s*\\S",
+                      "type": "string"
+                    }
+                  ],
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "action": {
+                        "description": "Obj@Act, e.g. BallHeavy, BallLight, BouncePad, Camera, CubyEyeL, CubyEyeR",
+                        "type": "string"
+                      },
+                      "at": {
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      "audio": {
+                        "enum": [
+                          "sound.ogg"
+                        ],
+                        "type": "string"
+                      },
+                      "camera": {
+                        "enum": [
+                          "Law1",
+                          "Law2",
+                          "Law3",
+                          "NewtonWide"
+                        ],
+                        "type": "string"
+                      },
+                      "subs": {
+                        "description": "cue range in newton_intro.srt, newton_law1.srt, newton_law2.srt, newton_law3.srt, newton_outro.srt",
+                        "type": "string"
+                      },
+                      "wait": {
+                        "type": "boolean"
+                      }
+                    },
+                    "type": "object"
+                  }
+                ]
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "end": {
+              "description": "goto: intro, law1, law2, law3, outro; choice: ",
+              "pattern": "^(stop|goto \\S+|choice \\S+)$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "anims",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "start": {
+      "enum": [
+        "intro",
+        "law1",
+        "law2",
+        "law3",
+        "outro"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "start",
+    "sets"
+  ],
+  "title": "Talking Robots story.yml",
+  "type": "object"
+}

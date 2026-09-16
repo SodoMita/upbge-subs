@@ -1,0 +1,7 @@
+1
+00:00:00,500 --> 00:00:03,000
+SPHERO: Three laws, one engine, zero GPUs.
+
+2
+00:00:03,200 --> 00:00:05,400
+CUBY: Press R to run the lab again!

@@ -1,0 +1,15 @@
+1
+00:00:00,500 --> 00:00:03,000
+CUBY: Law three: action and reaction.
+
+2
+00:00:03,200 --> 00:00:05,600
+SPHERO: Gravity pulls the ball down...
+
+3
+00:00:05,800 --> 00:00:08,200
+...and the pad pushes back, equally.
+
+4
+00:00:08,400 --> 00:00:11,000
+CUBY: Equal and opposite - that is the bounce!

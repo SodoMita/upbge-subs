@@ -163,6 +163,51 @@ renders on top of the baked cues, which is exactly the garble this rule
 removes. **Jump to Set** is gone: the Preview Set buttons do
 that job (and much more).
 
+## Newton's laws: a second story where physics is the actor
+
+`newton.yml` + `newton_*.srt` + `newton_laws.blend` reuse the exact same
+engine (story sets, SRT cues, sidecar sync, `game_subtitles.py` driver,
+add-on panel) for a physics lab: Cuby and Sphero narrate while **Bullet
+rigid bodies perform** the three laws. The moving bodies carry no action
+at all - each demonstration is a one-shot kinematic rig triggered by an
+`action:` entry, and physics plays the rest:
+
+| set | station | trigger | what physics does |
+|---|---|---|---|
+| `law1` | frictionless ice + puck | `IcePusher` sweeps once | the puck keeps gliding at constant velocity (no net force) |
+| `law2` | 0.5 kg + 5 kg balls under a 2 kg hammer block | `Hammer` shelf slides away, the block falls | same stroke, 10x the mass = far less acceleration |
+| `law3` | ball on a trap door over a pad | `TrapDoor` slides open | the ball falls, the pad pushes back (collision sensor -> kinematic flick) and it rebounds |
+
+The tour is deliberately linear (`goto` chain, ends in `stop`): a rig is
+a one-shot performance, so re-entering a set would narrate an empty
+stage. Press **R** in the player to reload and run the lab again.
+
+Evidence, cheapest first:
+
+```sh
+python3 test_newton.py                      # story layer: sets, chains, sidecar ranges, cps
+upbge -b newton_laws.blend -P tools/verify_newton_physics.py
+#   law1 inertia: push v=0.58 m/s, later v=0.52 m/s (keeps gliding)
+#   law2 F=ma: light(0.5kg) v=1.23 m/s vs heavy(5kg) v=0.19 m/s
+#   law3 reaction: fell 2.14 m, pad flick rebounds to 1.05 m
+upbge -b newton_laws.blend -P tools/make_newton_stills.py   # docs/newton_law*.png
+UPBGE=$U sh tools/run_live_newton.sh        # live player smoke on software GL:
+#   5 sets entered, 0 actor/action failures, watch lines + captures
+```
+
+`verify_newton_physics.py` mirrors the game rig into a Blender rigid-body
+world (same Bullet, same masses/frictions, same kinematic actions) and
+bakes it headless - deterministic, no display, no rasterizer. The live
+smoke run proves the *story* drives correctly in the real player; on
+GPU-less boxes the player's first-frame catch-up bursts make in-game
+trajectories unreliable, which is exactly why the physics assertions
+live in the bake (see HANDOFF.md, "Software-GL physics notes").
+
+Rebuild pipeline:
+
+```sh
+xvfb-run -a $U/blender --factory-startup -P build_newton.py   # scene + rigs + bricks + sidecar
+$U/blender -b newton_laws.blend -P tools/make_newton_capture.py  # live-smoke variant
 ## Files
 
 | File | What it is |

@@ -1,0 +1,15 @@
+1
+00:00:00,500 --> 00:00:03,000
+SPHERO: Law two: F equals m times a.
+
+2
+00:00:03,200 --> 00:00:05,800
+One hammer stroke pushes both balls.
+
+3
+00:00:06,000 --> 00:00:08,400
+CUBY: Same push, but ten times the mass...
+
+4
+00:00:08,600 --> 00:00:11,600
+SPHERO: ...means ten times less acceleration. Look!

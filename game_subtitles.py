@@ -27,6 +27,11 @@ counter also lives on GameDirector as the "tick" property.
 Headless capture: set a game property CAPTURE on GameDirector (any value)
   -> screenshots every 2nd tick into //capture/, choices auto-confirm
   option 1, auto-quit at story end (30 s backstop).
+  CAPTURE_WATCH = "Name,Name2" (same object) adds a game_debug.log line
+  every 10th tick with those objects' world positions - the proof that
+  Bullet moved the bodies a story set triggered (physics has no keys).
+  CAPTURE_STRIDE = N screenshots every Nth tick instead of every 2nd
+  (long stories at 60 Hz would burn the capture budget otherwise).
 """
 
 import bge
@@ -494,6 +499,19 @@ def _update(cont):
             own["tw_dt"] = 1.0 / float(bge.logic.getLogicTicRate())
         except Exception:
             own["tw_dt"] = 1.0 / 60.0
+        try:  # capture-only: ~1 fps software rendering would trip the
+            if own["CAPTURE"]:  # engine's 5-ticks-per-frame clamp and
+                bge.logic.setMaxLogicFrame(256)   # desync story clock
+                bge.logic.setMaxPhysicsFrame(256)  # from physics time
+        except Exception:
+            pass
+        try:  # capture-only: slow logic rate = more story per rendered
+            tr = float(own["CAPTURE_TICRATE"])  # frame on software GL
+            if tr >= 1.0:  # (physics then runs 6x slower than story -
+                bge.logic.setLogicTicRate(tr)  # only for non-physics
+                own["tw_dt"] = 1.0 / tr  # demos!)
+        except Exception:
+            pass
         try:
             story_prop = own[STORY_PROP]
         except Exception:
@@ -707,7 +725,12 @@ def _update(cont):
              % (tick, t, set_id, state))
 
     # ---- headless capture mode ----
-    if capturing and tick % 2 == 0:
+    stride = 2
+    try:
+        stride = max(2, int(own["CAPTURE_STRIDE"]))
+    except Exception:
+        pass
+    if capturing and tick % stride == 0:
         try:
             import os as _os
             capdir = bge.logic.expandPath("//capture")
@@ -717,6 +740,23 @@ def _update(cont):
                 _os.path.join(capdir, "game_%04d.png" % own["cap_n"]))
         except Exception as ex:
             print("capture failed:", ex)
+    if capturing and tick % 10 == 0:
+        try:
+            watch = own["CAPTURE_WATCH"]
+        except Exception:
+            watch = ""
+        if watch:
+            parts = []
+            for nm in str(watch).split(","):
+                nm = nm.strip()
+                o = _obj(scene, nm)
+                if o is not None:
+                    p = o.worldPosition
+                    parts.append("%s=(%.2f,%.2f,%.2f)"
+                                 % (nm, p[0], p[1], p[2]))
+            if parts:
+                _log("game_subtitles: watch t=%.2f %s"
+                     % (t, " ".join(parts)))
     if capturing and state == "stop" and \
             (tick - own["tw_stop"]) * dt > STOP_HOLD:
         try:

@@ -18,6 +18,11 @@ For the next agent session. Read this first, then `README.md`, then `story.yml`.
 - `test_panel_draw.py` — drives the panel `draw()` in a fake layout (the only
   test that reaches the UI code).
 - `talking_robots.blend` — the demo scene (two robot actors, staged shot cams).
+- `newton.yml` + `newton_*.srt` + `newton_laws.blend` + `build_newton.py` /
+  `test_newton.py` — second demo: a Newton-mechanics lab where Bullet
+  bodies perform the laws; tools `make_newton_capture.py`,
+  `verify_newton_physics.py`, `make_newton_stills.py`,
+  `run_live_newton.sh`; poster stills in `docs/newton_law*.png`.
 - Target engine: **UPBGE 0.50 (Blender 5.0.1)**, Linux x64.
 
 ## Current state (2026-09-16): v2 done, side branches merged, verified except on a GPU
@@ -138,13 +143,25 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
 
 ## Still open / known gaps (pick from here)
 
-- **Nothing has ever run the game for real** (no GPU here): `playAction(name,
+- **The game HAS run live** (2026-09-16, sway/XWayland + X11 + llvmpipe,
+  system Mesa 25, patched binaries): the Newton capture variant completed
+  the full five-set tour (`sh tools/run_live_newton.sh` -> PASS: 5 sets
+  entered, stop reached, zero actor/action failures), and earlier
+  talking-robots runs proved init + all 12 `playAction` calls. What is
+  still unverified: EEVEE pixel quality on a real GPU (no GPU here).
+- OLD NOTE **Nothing has ever run the game for real** (no GPU here): `playAction(name,
   f0, f1, …)` finding a *named* action among several on one object is only
   proven against the mocked `bge`. If a real UPBGE run shows actors not
   moving, that call is the suspect — the fallback would be assigning
   `animation_data.action` per set before playing (the preview already does
   exactly that, so `preview` correctness transfers).
-- `game_debug.log` capture mode (`set_capture.py`) was not re-run for v2.
+- Capture mode re-run and extended for the Newton harness: game
+  properties `CAPTURE` (screenshots + auto-quit), `CAPTURE_WATCH`
+  (world-position lines in game_debug.log every 10th tick),
+  `CAPTURE_STRIDE` (screenshot every Nth tick; 60 Hz stories burn the
+  ~900-capture budget at stride 2) and `CAPTURE_TICRATE` (slow logic
+  clock for bounded trajectories on software GL). A talking-robots
+  capture pass with the v2 story is still owed on a faster machine.
 - **No audio content**: `./audio/` doesn't exist, so `audio:` anims and the
   speaker-strip path are only covered by the fake-`bge` tests. Blender 5 has
   no `bpy.data.sounds`/`AudioPreview`; the add-on uses
@@ -167,6 +184,43 @@ and `test_panel_draw.py` (10 states, and it asserts the .blend was not modified)
   (`bpy.app.binary_path`) and ~2 spare GB; it skips (loudly, with a `SKIP` log
   line, not a failure) otherwise, and `TW_SKIP_BUILD_TWICE=1` skips it on
   purpose. On this box all four child runs cost ~3 s.
+
+## Software-GL physics notes (Newton example, 2026-09-16)
+
+- `scene.game_settings.use_frame_rate` (World > Physics > "Use Frame
+  Rate") selects the engine clock. OFF = variable mode: physics steps
+  with the REAL frame dt (a 1 s software frame = 1 s of physics per
+  logic tick) while the story clock ticks at 1/ticrate - the two diverge
+  by the frame time. ON = fixed mode: `int(real_dt * ticrate)` ticks per
+  rendered frame, physics dt = 1/ticrate = story dt. Physics demos need
+  ON at the default 60 Hz; `CAPTURE_TICRATE=10` then runs physics 6x
+  slower than story (bounded trajectories, smoke runs only).
+- The engine clamps logic/physics subframes to 5 per rendered frame
+  (`KX_KetsjiEngine::m_maxLogicFrame/m_maxPhysicsFrame`); at ~1 fps the
+  story would lag real time forever. The driver raises both to 256 in
+  capture mode (`bge.logic.setMaxLogicFrame/setMaxPhysicsFrame`).
+- The first rendered frame (shader compile, ~5 s here) becomes a
+  catch-up burst; depenetration pops during it launch small bodies.
+  In-game trajectories on GPU-less boxes are therefore UNRELIABLE -
+  physics correctness is asserted by the deterministic headless Bullet
+  bake (`tools/verify_newton_physics.py`), live runs only prove the
+  story drives (sets, cues, cameras, actions, no failures).
+- Restitution is effectively dead in this Bullet fork: an isolated
+  0.75-on-0.75 drop does not bounce at all. law3's rebound is
+  mechanical: Collision sensor on BouncePad -> ACTION actuator playing
+  the kinematic `law3__padflick` (the pad pushes back).
+- A kinematic trigger (STATIC+action in game, passive+kinematic in a
+  bake) transfers velocity independent of the target mass, so it cannot
+  demonstrate F=ma. law2 uses a finite-mass DYNAMIC hammer block (2 kg)
+  dropped from a kinematic shelf: momentum transfer then scales with
+  1/(m_block+m_ball) - measured 1.23 m/s (0.5 kg) vs 0.19 m/s (5 kg).
+- Builder gotcha: keying loops leave each rig object on its LAST key;
+  set rest transforms = hold poses (and `frame_set(1)`) before saving,
+  or the game loads rigs mid-stroke and `playAction` frame 1 teleports
+  them into the bodies at set start.
+- bpy logic enums differ from KX names: sensor `COLLISION` (there is no
+  `TOUCH`), controller `LOGIC_AND`, `game_property_new` has no `TEXT`
+  type (STRING; Text values are KX-runtime only - gotcha #1 stands).
 
 ## Locked design decisions (do not relitigate without the user)
 
