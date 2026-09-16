@@ -1,0 +1,140 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Talking Robots story.yml",
+  "type": "object",
+  "required": [
+    "start",
+    "sets"
+  ],
+  "properties": {
+    "start": {
+      "type": "string",
+      "enum": [
+        "cuby",
+        "main",
+        "sphero"
+      ]
+    },
+    "cps": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "sets": {
+      "type": "object",
+      "patternProperties": {
+        "^.+$": {
+          "type": "object",
+          "required": [
+            "anims",
+            "end"
+          ],
+          "properties": {
+            "anims": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "anyOf": [
+                  [
+                    {
+                      "type": "string",
+                      "pattern": "^(subs|action|camera|audio):\\s*\\S",
+                      "description": "subs: file.srt#a-b | action: Obj@Act | camera: Shot | audio: file.ogg"
+                    }
+                  ],
+                  {
+                    "type": "object",
+                    "properties": {
+                      "subs": {
+                        "type": "string",
+                        "description": "cue range in cuby.srt, dialogue.srt, sphero.srt"
+                      },
+                      "action": {
+                        "type": "string",
+                        "description": "Obj@Act, e.g. BeamL, BeamR, Camera, ChoiceMenu, Cuby, CubyAntenna"
+                      },
+                      "camera": {
+                        "type": "string",
+                        "enum": [
+                          "Camera",
+                          "Cuby",
+                          "Sphero",
+                          "Wide"
+                        ]
+                      },
+                      "audio": {
+                        "type": "string",
+                        "enum": [
+                          "sound.ogg"
+                        ]
+                      },
+                      "at": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "wait": {
+                        "type": "boolean"
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "end": {
+              "type": "string",
+              "pattern": "^(stop|goto \\S+|choice \\S+)$",
+              "description": "goto: cuby, main, sphero; choice: pick, pick2"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "choices": {
+      "type": "object",
+      "patternProperties": {
+        "^.+$": {
+          "type": "object",
+          "required": [
+            "prompt",
+            "options"
+          ],
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "pattern": "^\\S+#\\d+$",
+              "description": "cue ref in cuby.srt, dialogue.srt, sphero.srt"
+            },
+            "options": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "description": "key 1-9"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string",
+                    "enum": [
+                      "cuby",
+                      "main",
+                      "sphero"
+                    ]
+                  }
+                ],
+                "minItems": 3,
+                "maxItems": 3
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

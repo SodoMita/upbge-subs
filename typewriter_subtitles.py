@@ -15,19 +15,24 @@
 bl_info = {
     "name": "Typewriter Subtitles (3D Text Keyframes)",
     "author": "Arena Agent",
-    "version": (1, 8, 0),
+    "version": (1, 9, 0),
     "blender": (2, 83, 0),
     "location": "3D Viewport > Sidebar (N) > Subtitles;  Add > Text > Typewriter Subtitles;  File > Import/Export",
-    "description": "3D text subtitles keyframed on the timeline. Each key starts a fresh "
-                   "character-by-character (typewriter) reveal; the text is cleared "
-                   "automatically when the next key starts. Keys are draggable in the "
-                   "Timeline. Link an SRT or WebVTT file to reload it with one "
-                   "click (or automatically) after editing it externally. Lines are "
-                   "auto-backed-up on the object; the panel shows sync status and "
-                   "one-click Rebuild / Recover. Add Game Logic exports lines "
-                   "for real-time play in UPBGE/BGE. SRT [BRANCH], [CHOICE] "
-                   "and [CAM] lines are understood, not shown; branch "
-                   "markers get one-click playhead jumps.",
+    "description": "3D text subtitles on timeline keyframes + animation-centric "
+                   "story sets for UPBGE. Each key starts a character-by-character "
+                   "(typewriter) reveal; the text is cleared when the next key "
+                   "starts, and keys stay draggable in the Timeline. Link an SRT "
+                   "or WebVTT file to reload it with one click (or automatically) "
+                   "after editing it externally; lines are auto-backed-up on the "
+                   "object, with one-click Rebuild / Recover. For stories: Preview "
+                   "Set aims the scene at one set of story.yml (its cues, its "
+                   "actions, its shot, its menu, its length), Refresh Sync writes "
+                   "story.sync.json + the VSCode schema (also on save), Check "
+                   "validates the story against the scene, and a rename watch keeps "
+                   "story.yml's references in step. Bake to Objects freezes typing "
+                   "per set (<set>_Line##) so renders need no add-on; Add Game "
+                   "Logic exports lines for real-time play in UPBGE/BGE. "
+                   "[CAM] cue lines steer the shot; they are understood, not shown.",
     "category": "Animation",
 }
 
@@ -890,6 +895,24 @@ def bake_typewriter(obj, scene, prefix="SubLine"):
             bpy.data.objects.remove(o, do_unlink=True)
         except Exception:
             pass
+    # A re-bake must reuse the same names: the curve (and the per-object
+    # scale action) a previous bake created stays behind as an orphan until
+    # Blender purges it, and a squatting orphan would name this bake's
+    # objects `...01.001`. Only zero-user blocks carrying *this* prefix are
+    # dropped - the user's own data is never touched.
+    for coll in (bpy.data.curves, bpy.data.meshes):
+        for d in [d for d in coll if d.users == 0
+                  and d.name.startswith(prefix)]:
+            try:
+                coll.remove(d)
+            except Exception:
+                pass
+    for a in [a for a in bpy.data.actions if a.users == 0
+              and not a.use_fake_user and a.name.startswith(prefix)]:
+        try:
+            bpy.data.actions.remove(a)
+        except Exception:
+            pass
     entries = sorted(obj.tw_entries, key=lambda e: e.frame)
     fps = scene_fps(scene)
     cps = max(float(obj.tw_cps), 0.01)
@@ -1540,52 +1563,6 @@ class TW_OT_reload_addon(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _jump_marker_items(self, context):
-    try:
-        markers = context.scene.timeline_markers
-    except Exception:
-        return [("NONE", "No markers", "")]
-    items = [(m.name, "%s  (frame %d)" % (m.name, m.frame), "")
-             for m in markers if m.name.startswith(("SET-", "CH-"))]
-    return items or [("NONE", "No branch markers", "")]
-
-
-class TW_OT_jump_to_marker(bpy.types.Operator):
-    bl_idname = "tw.jump_to_marker"
-    bl_label = "Jump to Set Marker"
-    bl_description = ("Jump the playhead to a story set/choice marker "
-                      "(SET-*, CH-*); also frames the marker's camera, if any")
-    bl_options = {'REGISTER', 'UNDO'}
-
-    marker: bpy.props.EnumProperty(name="Marker", items=_jump_marker_items)
-
-    @classmethod
-    def poll(cls, context):
-        try:
-            return any(m.name.startswith(("SET-", "CH-"))
-                       for m in context.scene.timeline_markers)
-        except Exception:
-            return False
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
-
-    def execute(self, context):
-        scene = context.scene
-        m = scene.timeline_markers.get(self.marker)
-        if m is None:
-            self.report({'WARNING'}, "Marker is gone")
-            return {'CANCELLED'}
-        scene.frame_current = m.frame
-        try:
-            if m.camera_data is not None:
-                scene.camera = m.camera_data
-        except Exception:
-            pass
-        self.report({'INFO'}, "Jumped to %s (frame %d)" % (m.name, m.frame))
-        return {'FINISHED'}
-
-
 class TW_OT_rebuild_keys(bpy.types.Operator):
     bl_idname = "tw.rebuild_keys"
     bl_label = "Rebuild Subtitle Keys"
@@ -1918,13 +1895,966 @@ class TW_OT_bake_typewriter(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.active_object
-        n = bake_typewriter(obj, context.scene)
+        sname = (getattr(context.scene, "tw_preview_set", "") or "").strip()
+        n = bake_typewriter(obj, context.scene,
+                            prefix=("%s_Line" % sname) if sname
+                            else "SubLine")
         if n > 0:
             self.report({'INFO'}, "Baked %d subtitle objects (live typing off)"
                         % n)
             return {'FINISHED'}
         self.report({'WARNING'}, "Nothing baked (no lines?)")
         return {'CANCELLED'}
+
+
+# ---------------------------------------------------------------------------
+# Story v2: set preview, sync sidecar, rename watch, validation
+#
+# All of it degrades gracefully: a project without story.py/story.yml next to
+# the .blend simply gets "story not found" in the Story box, and the subtitle
+# features keep working exactly as before.
+# ---------------------------------------------------------------------------
+
+_UID_PROP = "_tw_uid"          # invisible ID property = stable identity
+_UID_SEQ = "tw_uid_seq"        # scene ID property: next uid number
+_AUDIO_TAG = "TwAudio_"        # auto-managed timeline-audio strip prefix
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_STORY_LIB_CACHE = {}          # story.py path -> (mtime, module)
+_NAME_SNAPSHOT = {}            # uid -> (name, type) as of the last check
+_CHECK_STATE = {"errors": [], "warnings": [], "bindings": [], "stamp": ""}
+
+
+def _say(msg):
+    """Console line for the story tools (`_log` belongs to the game driver)."""
+    print("Typewriter Subtitles: " + str(msg), flush=True)
+
+
+def story_path_of(scene):
+    """Resolved story.yml path for editor tools ('' when unset/missing)."""
+    try:
+        raw = (scene.tw_story or "").strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        raw = "//story.yml"
+    try:
+        path = bpy.path.abspath(raw)
+    except Exception:
+        path = raw
+    if not path:
+        path = os.path.join(_HERE, "story.yml")
+    return path if os.path.isfile(path) else ""
+
+
+def _load_story_lib(lib_path):
+    """Import story.py from the story's folder (same trick as the driver)."""
+    import importlib.util
+    mtime = os.path.getmtime(lib_path)
+    hit = _STORY_LIB_CACHE.get(lib_path)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    spec = importlib.util.spec_from_file_location("tw_story_lib_addon",
+                                                  lib_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _STORY_LIB_CACHE[lib_path] = (mtime, mod)
+    return mod
+
+
+def load_story(scene, quiet=False):
+    """(lib, loaded) for the scene's story; (None, None) when unavailable.
+
+    loaded is story.load_story_files(): {"errors","warnings","story","dir",
+    "files","audio"}. Nothing here raises: validation output is for the panel.
+    """
+    path = story_path_of(scene)
+    if not path:
+        if not quiet:
+            _say("story: no story.yml found next to the blend")
+        return None, None
+    try:
+        lib = _load_story_lib(os.path.join(os.path.dirname(path), "story.py"))
+    except Exception as ex:
+        if not quiet:
+            _say("story: parser story.py unreadable (%r)" % (ex,))
+        return None, None
+    try:
+        return lib, lib.load_story_files(path)
+    except Exception as ex:
+        import traceback
+        traceback.print_exc()
+        return lib, {"errors": ["story load failed: %r" % (ex,)],
+                     "warnings": [], "story": {}, "dir": os.path.dirname(path),
+                     "files": {}, "audio": {}}
+
+
+def _scene_names():
+    """(object names, action names, camera names) of the whole file."""
+    return (sorted(o.name for o in bpy.data.objects),
+            sorted(a.name for a in bpy.data.actions),
+            sorted(o.name for o in bpy.data.objects if o.type == 'CAMERA'))
+
+
+def _uid_of(block, stamp, seq):
+    """Read (and optionally stamp) the invisible stable id of an ID."""
+    try:
+        uid = block.get(_UID_PROP)
+    except Exception:
+        return None, seq
+    if isinstance(uid, str) and uid:
+        return uid, seq
+    if not stamp:
+        return None, seq
+    seq += 1
+    uid = "u%d" % seq
+    try:
+        block[_UID_PROP] = uid
+    except Exception:
+        return None, seq
+    return uid, seq
+
+
+def live_uids(stamp=False, include=None):
+    """{uid: {"name","type"}} over objects (cams as 'camera') + actions.
+
+    The identity map the rename watch compares with the sidecar. `include`
+    (a name set) aims the stamping at what the story references.
+    """
+    out, seq = {}, 0
+    scene = bpy.context.scene
+    if scene is not None:
+        try:
+            seq = int(scene.get(_UID_SEQ, 0))
+        except Exception:
+            seq = 0
+    for o in bpy.data.objects:
+        kind = "camera" if o.type == 'CAMERA' else "object"
+        if include is not None and o.name not in include:
+            continue
+        uid, seq = _uid_of(o, stamp, seq)
+        if uid:
+            out[uid] = {"name": o.name, "type": kind}
+    for a in bpy.data.actions:
+        if include is not None and a.name not in include:
+            continue
+        uid, seq = _uid_of(a, stamp, seq)
+        if uid:
+            out[uid] = {"name": a.name, "type": "action"}
+    if stamp and scene is not None:
+        try:
+            scene[_UID_SEQ] = seq
+        except Exception:
+            pass
+    return out
+
+
+def _key_range(action):
+    """[f0, f1] over every keyframe of an action (Blender 5 layered API)."""
+    lo = hi = None
+    for fc in _action_fcurves(action):
+        for k in fc.keyframe_points:
+            lo = k.co.x if lo is None else min(lo, k.co.x)
+            hi = k.co.x if hi is None else max(hi, k.co.x)
+    if lo is None:
+        return None
+    return [int(round(lo)), int(round(hi))]
+
+
+def live_action_ranges():
+    """{action name: [f0, f1]} from the scene (Refresh Sync's source).
+
+    Orphaned actions are skipped: a re-bake leaves the old `<obj>_anim`
+    datablocks behind until Blender purges them, and the sidecar must not
+    fill up with ranges nobody plays. Fake users count as kept-on-purpose
+    (that is exactly what the story guard does).
+    """
+    out = {}
+    for a in bpy.data.actions:
+        if a.users == 0 and not a.use_fake_user:
+            continue
+        rng = _key_range(a)
+        if rng is not None:
+            out[a.name] = rng
+    return out
+
+
+def story_refs(lib, story):
+    """(action names, object names, camera names) the story references."""
+    acts, objs, cams = set(), set(), set()
+    for _name, s in (story.get("sets", {}) or {}).items():
+        if not isinstance(s, dict):
+            continue
+        for e in s.get("anims", []) or []:
+            anim, err = (lib.normalize_anim(e) if isinstance(e, (str, dict))
+                         else (None, "x"))
+            if err or anim is None:
+                continue
+            if anim["type"] == "action":
+                o, a, _ = lib.parse_action_ref(anim["value"])
+                if o:
+                    objs.add(o)
+                if a:
+                    acts.add(a)
+            elif anim["type"] == "camera":
+                cams.add(str(anim["value"]).strip())
+    return acts, objs, cams
+
+
+def fake_user_guard(lib, story):
+    """Keep story actions alive across purge (nothing references them at
+    save time: they only play when their set is previewed) -> count."""
+    names, _objs, _cams = story_refs(lib, story)
+    n = 0
+    for a in bpy.data.actions:
+        if a.name in names and not a.use_fake_user:
+            a.use_fake_user = True
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
+# per-set preview: the timeline plays ONE set at a time (set-local frames)
+# ---------------------------------------------------------------------------
+
+def set_entries_from_plan(obj, scene, plan, fps, frame_start):
+    """Load one set's cues as this object's subtitle lines.
+
+    Entries are rebuilt from scratch (set-local frames) so the object keeps
+    every normal feature: live typing, draggable keys, the backup, SRT
+    import/export. Returns the number of lines written.
+    """
+    frames = []
+    for (start, _end, text) in plan["subs"]:
+        f = int(frame_start) + int(round(start * fps))
+        if frames and f <= frames[-1][0]:
+            f = frames[-1][0] + 1        # two anims may collide on a frame
+        frames.append((f, text))
+    obj.tw_entries.clear()
+    _delete_fcurve(obj)
+    obj.tw_uid_counter = 0
+    for f, text in frames:
+        _create_entry(obj, f, text)
+    _write_backup(obj, force=True)
+    _update_body_impl(obj, scene)
+    return len(frames)
+
+
+def _slot_for(action, obj):
+    """The action slot driving `obj` (created when the action has none)."""
+    slots = list(getattr(action, "slots", []) or [])
+    for s in slots:
+        try:
+            if s.identifier == "OB" + obj.name:
+                return s
+        except Exception:
+            pass
+    if slots:
+        return slots[0]
+    try:
+        return action.slots.new(id_type='OBJECT', name=obj.name)
+    except Exception:
+        return None
+
+
+def assign_set_actions(scene, plan):
+    """Point every actor of the set at the set's action (+ its slot).
+
+    Blender 5 wants the slot assigned AFTER the action (a slot of another
+    action raises). Returns (assigned, missing) name lists.
+    """
+    assigned, missing = [], []
+    for (oname, aname, _at, _wait, _dur) in plan["actions"]:
+        obj = bpy.data.objects.get(oname)
+        action = bpy.data.actions.get(aname)
+        if obj is None or action is None:
+            missing.append("%s@%s" % (oname, aname))
+            continue
+        ad = obj.animation_data or obj.animation_data_create()
+        if ad.action is not action:
+            try:
+                ad.action = action
+            except Exception:
+                pass
+        slot = _slot_for(action, obj)
+        if slot is not None:
+            try:
+                ad.action_slot = slot
+            except Exception:
+                pass
+        assigned.append(aname)
+    return assigned, missing
+
+
+def snap_opening_shot(scene, plan):
+    """Copy the set's opening staged camera onto the render camera (+lens).
+
+    The game moves the camera procedurally between the staged shots; the
+    editor gets the opening framing so a preview (and a render) looks right
+    without a camera bake.
+    """
+    cam = scene.camera
+    if cam is None or not plan["shots"]:
+        return ""
+    shot = bpy.data.objects.get(plan["shots"][0][1])
+    if shot is None or shot.type != 'CAMERA':
+        return "shot '%s' is not a camera" % plan["shots"][0][1]
+    try:
+        bpy.context.view_layer.update()
+        mat = shot.matrix_world.copy()
+        if cam.parent is not None:
+            mat = cam.parent.matrix_world.inverted() @ mat
+        cam.matrix_basis = mat
+        cam.data.lens = shot.data.lens
+    except Exception as ex:
+        return "camera snap failed: %r" % (ex,)
+    return ""
+
+
+def sync_speakers(scene, loaded, plan, fps, frame_start, set_name):
+    """Rebuild the auto-managed timeline audio for this set.
+
+    The game plays audio with `aud`; the editor plays the scene's sequencer,
+    so each audio anim gets a sound strip at its offset (strips of other sets
+    are left alone; only TwAudio_<set>_* are managed). Returns a message.
+    """
+    if not plan["audios"] and not any(
+            s.name.startswith(_AUDIO_TAG + set_name)
+            for s in getattr(getattr(scene, "sequence_editor", None),
+                             "strips", ()) or ()):
+        return ""
+    try:
+        ed = scene.sequence_editor or scene.sequence_editor_create()
+    except Exception as ex:
+        return "audio: no sequencer (%r)" % (ex,)
+    tag = _AUDIO_TAG + set_name
+    for s in [x for x in ed.strips if x.name.startswith(tag)]:
+        try:
+            ed.strips.remove(s)
+        except Exception:
+            pass
+    if not plan["audios"]:
+        return ""
+    made = 0
+    for i, (fname, at) in enumerate(plan["audios"]):
+        path = (loaded.get("audio") or {}).get(fname, "")
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            strip = ed.strips.new_sound(name="%s%02d" % (tag, i + 1),
+                                        filepath=path, channel=1,
+                                        frame_start=int(frame_start)
+                                        + int(round(at * fps)))
+            made += 1
+            del strip
+        except Exception as ex:
+            return "audio '%s' could not be previewed (%r)" % (fname, ex)
+    try:
+        scene.use_audio = made > 0
+    except Exception:
+        pass
+    return "%d sound strip(s)" % made if made else ""
+
+
+def menu_preview(scene, plan, story):
+    """Choice menu text for the previewed set ('' when it has no choice)."""
+    menu = bpy.data.objects.get("ChoiceMenu")
+    if menu is None or menu.type != 'FONT':
+        return "no ChoiceMenu text object"
+    body = ""
+    kind, target = plan["end"]
+    if kind == "choice":
+        ch = (story.get("choices", {}) or {}).get(target) or {}
+        opts = [list(o) for o in ch.get("options", []) or []]
+        body = menu_body_for(opts)
+    try:
+        menu.data.body = body
+        menu.scale = (1.0, 1.0, 1.0)
+    except Exception as ex:
+        return "menu write failed: %r" % (ex,)
+    return ""
+
+
+def menu_body_for(options):
+    """Static menu text (cursor on option 1) - story.menu_body without
+    importing the story lib (baked into the add-on on purpose)."""
+    return "\n".join("%s %s: %s" % (">" if i == 0 else " ", o[0], o[1])
+                     for i, o in enumerate(options))
+
+
+# ---------------------------------------------------------------------------
+# validation + Refresh Sync (story.sync.json / story.schema.json)
+# ---------------------------------------------------------------------------
+
+def story_check_impl(scene):
+    """Validate the story files + the scene bindings -> report dict.
+
+    Pure read. `_CHECK_STATE` mirrors the result for the panel, so the Story
+    box can show it without re-reading files on every redraw.
+    """
+    lib, loaded = load_story(scene)
+    rep = {"ok": False, "path": story_path_of(scene), "errors": [],
+           "warnings": [], "bindings": [], "sets": [], "start": ""}
+    if loaded is None:
+        rep["errors"] = ["story.yml not found next to the blend "
+                         "(set the Story File field)"]
+        _CHECK_STATE.update(rep)
+        return rep
+    rep["errors"] = list(loaded["errors"])
+    rep["warnings"] = list(loaded["warnings"])
+    story = loaded["story"] or {}
+    rep["sets"] = sorted(str(k) for k in (story.get("sets") or {}))
+    rep["start"] = str(story.get("start") or "")
+    if not rep["errors"]:
+        objs, acts, cams = _scene_names()
+        side = lib.load_sidecar(lib.sync_path_for(rep["path"]))
+        rep["bindings"] = lib.check_bindings(story, objs,
+                                             sorted(set(acts)
+                                                    | set(side["actions"])),
+                                             cams)
+    rep["ok"] = not rep["errors"] and not rep["bindings"]
+    rep["stamp"] = time.strftime("%H:%M:%S")
+    _CHECK_STATE.update(rep)
+    return rep
+
+
+def refresh_sync_impl(scene, write_schema=True):
+    """Refresh Sync: action ranges + uid map + schema, and fake users.
+
+    The sidecar is what the game (and the timeline preview) needs to know how
+    long each set action runs; the uid map is what the rename watch compares
+    against. Written on save too, so it can never drift far.
+    """
+    lib, loaded = load_story(scene)
+    rep = story_check_impl(scene)
+    if lib is None:
+        rep["written"] = []
+        rep["note"] = "story.py not found next to story.yml"
+        return rep
+    path = rep["path"]
+    side = lib.load_sidecar(lib.sync_path_for(path))
+    acts, objs, cams = story_refs(lib, loaded["story"] if loaded else {})
+    watch = set(acts) | set(objs) | set(cams)
+    rep["fake_users"] = fake_user_guard(lib, (loaded or {}).get("story", {}))
+    uids = dict(side["uids"])
+    live = live_uids(stamp=True, include=watch)
+    renames, new_ids, _missing = lib.diff_uids(uids, live)
+    for uid, rec in live.items():
+        uids[uid] = rec
+    ranges = live_action_ranges()
+    missing = sorted(a for a in acts if a not in ranges)
+    payload = lib.sidecar_payload(uids, ranges)
+    err = lib.save_sidecar(lib.sync_path_for(path), payload)
+    rep["written"] = [] if err else [os.path.basename(
+        lib.sync_path_for(path))]
+    rep["ranges"] = len(ranges)
+    rep["missing_ranges"] = missing
+    rep["uids_new"] = len(new_ids)
+    if err:
+        rep["errors"] = rep["errors"] + [err]
+    if missing:
+        rep["warnings"] = rep["warnings"] + [
+            "action '%s' has no keyframes (the game cannot time it)" % m
+            for m in missing]
+    if write_schema:
+        cams = _scene_names()[2]
+        try:
+            audio = sorted(os.path.basename(p)
+                           for p in ((loaded or {}).get("audio") or
+                                     {}).values())
+            sch = lib.build_schema((loaded or {}).get("story", {}),
+                                   [o.name for o in bpy.data.objects],
+                                   [a.name for a in bpy.data.actions],
+                                   cams,
+                                   sorted((loaded or {}).get("files", {})),
+                                   audio)
+            import json as _json
+            with open(lib.schema_path_for(path), "w",
+                      encoding="utf-8") as fh:
+                _json.dump(sch, fh, indent=2, ensure_ascii=False)
+                fh.write("\n")
+            rep["written"].append(os.path.basename(
+                lib.schema_path_for(path)))
+        except Exception as ex:
+            rep["warnings"].append("schema not written (%r)" % (ex,))
+    rep["renames"] = renames
+    _NAME_SNAPSHOT.clear()
+    _NAME_SNAPSHOT.update({k: (v["name"], v["type"])
+                           for k, v in live.items()})
+    _CHECK_STATE.update({"stamp": time.strftime("%H:%M:%S")})
+    return rep
+
+
+# ---------------------------------------------------------------------------
+# rename watch (stable uids -> targeted story.yml / [CAM] rewrite)
+# ---------------------------------------------------------------------------
+
+def _sidecar_uids(scene, lib=None):
+    """The uid map recorded in story.sync.json ({} when unavailable)."""
+    path = story_path_of(scene)
+    if not path:
+        return {}
+    try:
+        lib = lib or _load_story_lib(os.path.join(
+            os.path.dirname(path), "story.py"))
+        return lib.load_sidecar(lib.sync_path_for(path))["uids"]
+    except Exception:
+        return {}
+
+
+def name_watch_scan(scene, force=False):
+    """Detect renames of story-referenced blocks -> pending (or auto-fixed).
+
+    Names are how the story refers to Blender data, so a rename breaks the
+    binding. Each block carries an invisible `_tw_uid`, and story.sync.json
+    records uid -> name; a mismatch is a rename. The depsgraph handler calls
+    this (a cheap dict compare); with Scene.tw_autorewrite the reference is
+    rewritten immediately, otherwise the panel offers Apply.
+    """
+    path = story_path_of(scene)
+    if not path or (bpy.app.background and not force):
+        return []        # headless runs stay deterministic (build/verify call
+                         # this with force=True when they want the diff)
+    try:
+        lib = _load_story_lib(os.path.join(os.path.dirname(path), "story.py"))
+    except Exception:
+        return []
+    live = live_uids(stamp=False)
+    cur = {k: (v["name"], v["type"]) for k, v in live.items()}
+    if not force and cur == _NAME_SNAPSHOT:
+        return []
+    _NAME_SNAPSHOT.clear()
+    _NAME_SNAPSHOT.update(cur)
+    renames, _new, _gone = lib.diff_uids(_sidecar_uids(scene, lib), live)
+    renames = [r for r in renames if r["type"] in ("object", "action",
+                                                   "camera")]
+    if not renames:
+        return []
+    if scene.tw_autorewrite:
+        rewrite_story_refs(scene, renames)
+        return renames
+    scene.tw_pending_renames.clear()
+    for r in renames:
+        it = scene.tw_pending_renames.add()
+        it.uid, it.kind, it.old, it.new = (r["uid"], r["type"], r["old"],
+                                           r["new"])
+    _say("rename watch: %d pending (Sidebar > Subtitles > Apply Renames)"
+         % len(renames))
+    _redraw_panels()
+    return renames
+
+
+def rewrite_story_refs(scene, renames):
+    """Rewrite references in story.yml (+ [CAM] lines of its .srt files).
+
+    Only reference positions are touched (labels, set names and prose stay),
+    files are replaced atomically, and a story with errors is never edited.
+    Returns (applied notes, files written).
+    """
+    path = story_path_of(scene)
+    if not path or not renames:
+        return [], []
+    lib, loaded = load_story(scene, quiet=True)
+    if lib is None or loaded is None:
+        return [], []
+    if loaded["errors"]:
+        return [], []          # never rewrite a story that does not parse
+    targets = [(path, "yml")]
+    for name in sorted(loaded.get("files", {})):
+        p = loaded["files"][name].get("path")
+        if p:
+            targets.append((p, "srt"))
+    applied, written = [], []
+    for target, kind in targets:
+        try:
+            with open(target, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        new, ap = lib.rewrite_refs(text, renames, kind)
+        if not ap or new == text:
+            continue
+        try:
+            tmp = target + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                fh.write(new)
+            os.replace(tmp, target)
+        except OSError as ex:
+            _say("rewrite failed for %s (%s)" % (target, ex))
+            continue
+        applied.extend("%s: %s" % (os.path.basename(target), a) for a in ap)
+        if target not in written:
+            written.append(target)
+    if written:
+        try:
+            refresh_sync_impl(scene)     # re-record uid names + ranges
+        except Exception:
+            pass
+    return applied, written
+
+
+# ---------------------------------------------------------------------------
+# the set preview (editor side of "press P is the full preview")
+# ---------------------------------------------------------------------------
+
+def preview_set_impl(scene, set_name, jump=True):
+    """Switch the timeline context to one story set -> (ok, [messages]).
+
+    Loads the set's cues as the subtitle lines, points every actor at the
+    set's own action, snaps the render camera to the set's opening shot,
+    fills the choice menu, swaps the auto-managed sound strips and sets the
+    frame range - all set-local, so pressing Space plays just this set and
+    pressing P plays the whole story. It only ever assigns; nothing here
+    deletes an action or a keyframe.
+    """
+    msgs = []
+    lib, loaded = load_story(scene, quiet=True)
+    if lib is None or loaded is None:
+        return False, ["story.yml/story.py not found next to the blend"]
+    if loaded["errors"]:
+        return False, ["story has errors - fix them first: "
+                       + "; ".join(loaded["errors"][:3])]
+    story, files = loaded["story"], loaded["files"]
+    sets = story.get("sets", {}) or {}
+    set_name = str(set_name or "").strip() or str(story.get("start") or "")
+    if set_name not in sets:
+        return False, ["no set '%s' (story has: %s)"
+                       % (set_name, ", ".join(sorted(str(k) for k in sets)))]
+    side = lib.load_sidecar(lib.sync_path_for(story_path_of(scene)))
+    ranges = dict(side["actions"])
+    ranges.update(live_action_ranges())
+    fps = scene_fps(scene)
+    plan = lib.set_plan(story, files, set_name, ranges, fps)
+    f0 = int(scene.frame_start)
+    want_end = f0 + int(round(lib.set_duration(plan) * fps))
+    sub = _preview_target(scene)
+    if sub is not None and sub.type == 'FONT':
+        n = set_entries_from_plan(sub, scene, plan, fps, f0)
+        msgs.append("%d subtitle line(s) on '%s'" % (n, sub.name))
+        try:            # the story's cps is the authoritative typing speed
+            want_cps = float(story.get("cps", 0) or 0)
+            if want_cps > 0 and abs(float(sub.tw_cps) - want_cps) > 1e-3:
+                sub.tw_cps = want_cps
+                for o in scene.objects:      # baked lines of this set too
+                    if o.type == 'FONT' and o.name.startswith(
+                            "%s_Line" % set_name):
+                        o.tw_cps = want_cps
+                msgs.append("typing speed %g cps (from story cps)"
+                            % want_cps)
+        except Exception:
+            pass
+    else:
+        msgs.append("no subtitle text object to load cues into (Add > Text > "
+                    "Typewriter Subtitles)")
+    assigned, missing = assign_set_actions(scene, plan)
+    if assigned:
+        msgs.append("actions: %s" % ", ".join(assigned))
+    for m in missing:
+        msgs.append("missing %s (add it or drop the anim)" % m)
+    err = snap_opening_shot(scene, plan)
+    if err:
+        msgs.append(err)
+    note = sync_speakers(scene, loaded, plan, fps, f0, set_name)
+    if note:
+        msgs.append("audio: " + note)
+    note = menu_preview(scene, plan, story)
+    if note:
+        msgs.append("menu: " + note)
+    guarded = fake_user_guard(lib, story)
+    if guarded:
+        msgs.append("fake user set on %d action(s)" % guarded)
+    try:
+        if int(scene.frame_end) != want_end:
+            scene.frame_end = want_end
+            msgs.append("frame range %d-%d (set-local)" % (f0, want_end))
+        scene.tw_preview_set = set_name
+        if jump and sub is not None and len(sub.tw_entries):
+            scene.frame_set(min(int(sub.tw_entries[0].frame), want_end))
+        elif jump:
+            scene.frame_set(f0)
+    except Exception as ex:
+        msgs.append("frame range skipped (%r)" % (ex,))
+    try:
+        story_check_impl(scene)
+    except Exception:
+        pass
+    _redraw_panels()
+    return True, msgs
+
+
+def _preview_target(scene):
+    """The text object the preview loads cues into.
+
+    Order is deliberate: the object named `Subtitles` (the demo's, and the
+    name the game driver types into) first, so previewing never lands on
+    some other text object that happens to be selected; then the active 3D
+    text (custom projects); then any text object that already has lines.
+    """
+    named = scene.objects.get("Subtitles") if scene is not None else None
+    if named is None:
+        named = bpy.data.objects.get("Subtitles")
+    if named is not None and named.type == 'FONT':
+        return named
+    try:
+        act = bpy.context.active_object
+        if act is not None and act.type == 'FONT':
+            return act
+    except Exception:
+        pass
+    for o in scene.objects:
+        if o.type == 'FONT' and len(o.tw_entries):
+            return o
+    return None
+
+
+# ---------------------------------------------------------------------------
+# panels/registration helpers
+# ---------------------------------------------------------------------------
+
+def write_sync_files(scene):
+    """Rewrite story.sync.json (+ schema) from the live scene, read-only.
+
+    Used by the save handler: unlike Refresh Sync it stamps nothing, so the
+    file does not come back dirty right after saving.
+    """
+    path = story_path_of(scene)
+    if not path:
+        return
+    try:
+        lib = _load_story_lib(os.path.join(os.path.dirname(path), "story.py"))
+    except Exception:
+        return
+    try:
+        uids = dict(lib.load_sidecar(lib.sync_path_for(path))["uids"])
+        for uid, rec in live_uids(stamp=False).items():
+            uids[uid] = rec
+        payload = lib.sidecar_payload(
+            uids, live_action_ranges())
+        err = lib.save_sidecar(lib.sync_path_for(path), payload)
+        if err:
+            _say(err)
+        _CHECK_STATE["stamp"] = time.strftime("%H:%M:%S")
+    except Exception as ex:
+        _say("sync on save skipped (%r)" % (ex,))
+
+
+def _redraw_panels():
+    try:
+        for area in bpy.context.screen.areas if bpy.context.screen else ():
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# story operators (preview / sync / rename / check)
+# ---------------------------------------------------------------------------
+
+_SET_PICK = {}     # enum identifier -> real set name (names can be odd)
+
+
+def _preview_set_items(self, context):
+    """One menu entry per story set (used by operator_enum + the popup)."""
+    _SET_PICK.clear()
+    lib, loaded = load_story(context.scene, quiet=True)
+    if loaded is None or loaded["errors"]:
+        return [("NONE", "No story (see Story box)", "")]
+    story = loaded["story"] or {}
+    start = str(story.get("start") or "")
+    items = []
+    for i, name in enumerate(sorted(str(k) for k in (story.get("sets") or {}))):
+        ident = "s%d" % i
+        _SET_PICK[ident] = name
+        items.append((ident, name + (" (start)" if name == start else ""),
+                      "Switch the timeline to set '%s'" % name))
+    return items or [("NONE", "Story has no sets", "")]
+
+
+class TW_OT_preview_set(bpy.types.Operator):
+    bl_idname = "tw.preview_set"
+    bl_label = "Preview Story Set"
+    bl_description = ("Aim the timeline at one story set: its cues become the "
+                      "subtitle lines, its actions go on the actors, its "
+                      "opening shot frames the camera, its choice fills the "
+                      "menu, its length sets the frame range. Nothing is "
+                      "deleted - other sets keep their keys (press P for the "
+                      "whole story)")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    set_id: bpy.props.EnumProperty(name="Set", items=_preview_set_items)
+
+    @classmethod
+    def poll(cls, context):
+        return bool(story_path_of(context.scene))
+
+    def execute(self, context):
+        name = _SET_PICK.get(self.set_id, self.set_id or "")
+        ok, msgs = preview_set_impl(context.scene, name)
+        for m in msgs:
+            self.report({'INFO'} if ok else {'WARNING'}, m)
+        if ok:
+            _say("preview set '%s': %s" % (name, "; ".join(msgs) or "ok"))
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
+class TW_OT_refresh_sync(bpy.types.Operator):
+    bl_idname = "tw.refresh_sync"
+    bl_label = "Refresh Sync"
+    bl_description = ("Write story.sync.json (action frame ranges + the "
+                      "rename watch's uid map) and story.schema.json (VSCode "
+                      "completion) from the live scene; keeps story actions "
+                      "from being purged. Also runs on save")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(story_path_of(context.scene))
+
+    def execute(self, context):
+        rep = refresh_sync_impl(context.scene)
+        for e in rep.get("errors", []):
+            self.report({'ERROR'}, e)
+        for w in rep.get("warnings", [])[:6]:
+            self.report({'WARNING'}, w)
+        if rep.get("written"):
+            self.report({'INFO'}, "wrote %s (%d ranges, %d uids)"
+                        % (" + ".join(rep["written"]), rep.get("ranges", 0),
+                           len(_sidecar_uids(context.scene))))
+            return {'FINISHED'}
+        self.report({'WARNING'}, rep.get("note") or "nothing written")
+        return {'CANCELLED'}
+
+
+class TW_OT_check_story(bpy.types.Operator):
+    bl_idname = "tw.check_story"
+    bl_label = "Check Story"
+    bl_description = ("Validate story.yml + every .srt it references, and "
+                       "cross-check the object/action/camera names against "
+                       "this scene (results listed in the Story box)")
+
+    @classmethod
+    def poll(cls, context):
+        return bool(story_path_of(context.scene))
+
+    def execute(self, context):
+        rep = story_check_impl(context.scene)
+        for key, kind in (("errors", 'ERROR'), ("warnings", 'WARNING'),
+                         ("bindings", 'ERROR')):
+            for m in rep.get(key, []):
+                self.report({kind}, "%s: %s" % (key, m))
+        clean = not rep["errors"] and not rep["bindings"]
+        _redraw_panels()
+        if clean:
+            self.report({'INFO'}, "story clean (%d sets)"
+                        % len(rep.get("sets", [])))
+            return {'FINISHED'}
+        return {'CANCELLED'}
+
+
+class TW_RenameItem(bpy.types.PropertyGroup):
+    uid: bpy.props.StringProperty(name="Uid")
+    kind: bpy.props.StringProperty(name="Kind")
+    old: bpy.props.StringProperty(name="Was")
+    new: bpy.props.StringProperty(name="Now")
+
+
+def _wrap_label(layout, text, icon):
+    """Plain wrapped text list (deliberately: no graphs, no fancy UI)."""
+    line = ""
+    for w in str(text).split():
+        if line and len(line) + len(w) + 1 > 44:
+            layout.label(text=line, icon=icon)
+            line = w
+        else:
+            line = (line + " " + w).strip() or line
+        if line == w and len(line) > 44:
+            layout.label(text=line[:44], icon=icon)
+            line = ""
+    if line:
+        layout.label(text=line, icon=icon)
+
+
+def _story_box(layout, context):
+    """Story (v2) box: set preview, sync + rename watch, validation lists."""
+    scene = context.scene
+    box = layout.box()
+    row = box.row(align=True)
+    row.label(text="Story sets", icon='SEQUENCE')
+    if scene.tw_preview_set:
+        row.label(text="in: " + scene.tw_preview_set, icon='TIME')
+    box.prop(scene, "tw_story", text="File")
+    if not story_path_of(scene):
+        box.label(text="No story.yml next to the blend", icon='INFO')
+        return
+    box.column(align=True).operator_enum("tw.preview_set", "set_id")
+    row = box.row(align=True)
+    row.operator("tw.refresh_sync", text="Refresh Sync", icon='FILE_REFRESH')
+    row.operator("tw.check_story", text="Check", icon='CHECKMARK')
+    if len(scene.tw_pending_renames):
+        box.label(text="%d rename(s) break story refs:"
+                  % len(scene.tw_pending_renames), icon='ERROR')
+        row = box.row(align=True)
+        row.template_list("TW_UL_renames", "", scene, "tw_pending_renames",
+                          scene, "tw_rename_index", rows=2)
+        box.operator("tw.apply_renames", text="Apply to Story",
+                     icon='GREASEPENCIL')
+    box.prop(scene, "tw_autorewrite", text="Auto-rewrite refs on rename")
+    st = _CHECK_STATE
+    n = 0
+    for key, icon in (("errors", 'ERROR'), ("bindings", 'ERROR'),
+                      ("warnings", 'INFO')):
+        for m in st.get(key, []) or []:
+            _wrap_label(box, "%s: %s" % (key[:-1], m), icon)
+            n += 1
+    if not n:
+        box.label(text="story clean" + (" (checked %s)" % st["stamp"]
+                                        if st.get("stamp") else ""),
+                  icon='CHECKMARK')
+
+
+class TW_UL_renames(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            layout.label(text="%s: %s -> %s" % (item.kind, item.old,
+                                                item.new),
+                         icon='OUTLINER_DATA_' + ('OBJECT_DATA'
+                                                  if item.kind == 'object' else
+                                                  'ACTION' if item.kind ==
+                                                  'action' else 'CAMERA_DATA'))
+        else:
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='GREASEPENCIL')
+
+
+class TW_OT_apply_renames(bpy.types.Operator):
+    bl_idname = "tw.apply_renames"
+    bl_label = "Apply Renames to Story"
+    bl_description = ("Rewrite the renamed object/action/camera names into "
+                      "story.yml (and [CAM] lines in the .srt files) - only "
+                      "where they are used as references, never in labels")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.tw_pending_renames) > 0
+
+    def execute(self, context):
+        renames = [{"uid": it.uid, "type": it.kind, "old": it.old,
+                    "new": it.new} for it in context.scene
+                    .tw_pending_renames]
+        applied, written = rewrite_story_refs(context.scene, renames)
+        context.scene.tw_pending_renames.clear()
+        _redraw_panels()
+        if applied:
+            self.report({'INFO'}, "rewrote %d reference(s) in %d file(s)"
+                        % (len(applied), len(written)))
+            for a in applied[:8]:
+                _say("  " + a)
+            return {'FINISHED'}
+        self.report({'INFO'}, "no references matched (names were not used "
+                              "in the story); uid map refreshed")
+        return {'FINISHED'}
 
 
 class TW_UL_entries(bpy.types.UIList):
@@ -1948,6 +2878,7 @@ class VIEW3D_PT_tw_subtitles(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         obj = context.active_object
+        _story_box(layout, context)
 
         if obj is None or obj.type != 'FONT':
             layout.label(text="No 3D text object selected")
@@ -2033,11 +2964,6 @@ class VIEW3D_PT_tw_subtitles(bpy.types.Panel):
         _grow.operator("tw.setup_game_logic", text="Add Game Logic", icon='PLAY')
         _grow.operator("tw.refresh_game_data", text="Refresh", icon='FILE_REFRESH')
 
-        if any(m.name.startswith(("SET-", "CH-"))
-               for m in context.scene.timeline_markers):
-            layout.operator("tw.jump_to_marker", text="Jump to Set...",
-                            icon='TIME')
-
         layout.operator("tw.reload_addon", icon='FILE_REFRESH')
 
         if context.scene.camera is not None and obj.parent != context.scene.camera:
@@ -2059,7 +2985,7 @@ class VIEW3D_PT_tw_subtitles(bpy.types.Panel):
                      "SRT/VTT linked files reload after external edits.",
                      "Lines are auto-backed-up; Rebuild/Recover fix mishaps.",
                      "Add Game Logic exports lines for UPBGE/BGE play.",
-                     "Jump to Set previews each story set.",
+                     "Story box: Preview Set switches the timeline to a set.",
                      "Bake to Objects freezes typing into text + modifiers."):
             box.label(text=line)
 
@@ -2270,6 +3196,11 @@ def tw_depsgraph_update(scene, depsgraph):
         _IN_HANDLER = False
     if dragging:
         _schedule_deferred_sync()
+    if not dragging and scene is not None:
+        try:
+            name_watch_scan(scene)      # uid diff -> pending/auto-renames
+        except Exception:
+            pass
 
 
 @bpy.app.handlers.persistent
@@ -2320,6 +3251,21 @@ def tw_load_post(*args):
 
 
 @bpy.app.handlers.persistent
+def tw_load_post_story(*args):
+    """Story-side load work (kept out of tw_load_post so the subtitle repair
+    below can never be blocked by a story problem)."""
+    scene = bpy.context.scene
+    if scene is None or bpy.app.background:
+        return
+    _NAME_SNAPSHOT.clear()
+    try:
+        story_check_impl(scene)
+        name_watch_scan(scene, force=True)
+    except Exception:
+        pass
+
+
+@bpy.app.handlers.persistent
 def tw_save_pre(*args):
     """Restore full cue text on baked one-line objects before saving.
 
@@ -2343,10 +3289,15 @@ def tw_save_pre(*args):
 
 @bpy.app.handlers.persistent
 def tw_save_post(*args):
-    """Recompute live bodies for the current frame after saving."""
+    """Refresh story.sync.json (+ schema) and recompute live bodies after a
+    save - the sidecar can then never drift from the keys just written."""
     scene = bpy.context.scene
     if scene is None:
         return
+    try:
+        write_sync_files(scene)
+    except Exception:
+        pass
     for obj in bpy.data.objects:
         try:
             if obj.type == 'FONT' and len(obj.tw_entries):
@@ -2355,9 +3306,6 @@ def tw_save_post(*args):
             pass
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -2373,10 +3321,15 @@ classes = (
     TW_OT_clear_animation,
     TW_OT_rebuild_keys,
     TW_OT_recover_backup,
-    TW_OT_jump_to_marker,
     TW_OT_setup_game_logic,
     TW_OT_refresh_game_data,
     TW_OT_bake_typewriter,
+    TW_RenameItem,
+    TW_UL_renames,
+    TW_OT_preview_set,
+    TW_OT_refresh_sync,
+    TW_OT_check_story,
+    TW_OT_apply_renames,
     TW_OT_import_subtitles,
     TW_OT_export_subtitles,
     TW_OT_reload_subtitles,
@@ -2444,9 +3397,38 @@ def register():
                     "when it changes on disk",
         default=False)
 
+    for prop in ("tw_story", "tw_preview_set", "tw_autorewrite",
+                 "tw_pending_renames", "tw_rename_index"):
+        if hasattr(bpy.types.Scene, prop):
+            try:
+                delattr(bpy.types.Scene, prop)
+            except Exception:
+                pass
+    bpy.types.Scene.tw_story = bpy.props.StringProperty(
+        name="Story File",
+        description="story.yml this project's sets live in (the game reads the "
+                    "tw_story game property on GameDirector; this one is for the "
+                    "editor tools)",
+        default="//story.yml", subtype='FILE_PATH')
+    bpy.types.Scene.tw_preview_set = bpy.props.StringProperty(
+        name="Preview Set",
+        description="Story set the timeline is currently aimed at (set by "
+                    "Preview Story Set; also the Bake to Objects name prefix)",
+        default="")
+    bpy.types.Scene.tw_autorewrite = bpy.props.BoolProperty(
+        name="Auto-rewrite refs on rename",
+        description="Rewrite story.yml (+ [CAM] lines) the moment a referenced "
+                    "object/action/camera is renamed; off = the panel offers "
+                    "Apply first",
+        default=False)
+    bpy.types.Scene.tw_pending_renames = bpy.props.CollectionProperty(
+        type=TW_RenameItem)
+    bpy.types.Scene.tw_rename_index = bpy.props.IntProperty(default=0)
+
     bpy.app.handlers.frame_change_post.append(tw_frame_change)
     bpy.app.handlers.depsgraph_update_post.append(tw_depsgraph_update)
     bpy.app.handlers.load_post.append(tw_load_post)
+    bpy.app.handlers.load_post.append(tw_load_post_story)
     bpy.app.handlers.save_pre.append(tw_save_pre)
     bpy.app.handlers.save_post.append(tw_save_post)
     bpy.types.VIEW3D_MT_add.append(_add_menu_func)
@@ -2499,6 +3481,8 @@ def unregister():
         bpy.app.handlers.depsgraph_update_post.remove(tw_depsgraph_update)
     if tw_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(tw_load_post)
+    if tw_load_post_story in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(tw_load_post_story)
     if tw_save_pre in bpy.app.handlers.save_pre:
         bpy.app.handlers.save_pre.remove(tw_save_pre)
     if tw_save_post in bpy.app.handlers.save_post:
@@ -2521,6 +3505,12 @@ def unregister():
                  "tw_uid_counter"):
         try:
             delattr(bpy.types.Object, prop)
+        except Exception:
+            pass
+    for prop in ("tw_story", "tw_preview_set", "tw_autorewrite",
+                 "tw_pending_renames", "tw_rename_index"):
+        try:
+            delattr(bpy.types.Scene, prop)
         except Exception:
             pass
 

@@ -1,229 +1,263 @@
-# Talking Robots — 3D Typewriter Subtitles in UPBGE
+# Talking Robots — 3D Typewriter Subtitles + Story Sets in UPBGE
 
 Two low-effort primitive robots (**Cuby** the cube and **Sphero** the sphere)
-having a 15-second talk-show conversation, subtitled with real 3D text via the
-**Typewriter Subtitles** addon. Built with and for **UPBGE 0.50**
-(Blender 5.0.1) — and it plays two ways: as a **timeline animation**
-(Spacebar) and as a **real-time game** (P).
+host a 15-second talk show, subtitled with real 3D text by the **Typewriter
+Subtitles** add-on, and wired into a branching story by **story.yml**. Built
+with and for **UPBGE 0.50** (Blender 5.0.1) — it plays two ways: as a
+**timeline animation** (Spacebar, one story set at a time) and as a
+**real-time game** (P, the whole branching story).
+
+This is **v2**: the story is *animation-centric*. A set is a bundle of
+animations that all start at the set's own `t=0` — subtitles are one animation
+type among others (`subs` / `action` / `camera` / `audio`) instead of a master
+timeline everything else is measured against.
 
 ## Watch it
 
-- `talking_robots_timeline.mp4` — the animation rendered in UPBGE
-  (640×360, 24 fps, 15 s, H.264). Covers the main set (v1.6
-  timeline); the choice + side sets below are playable via P
-  or by scrubbing past frame 360.
-- `test/test_0030.png`, `test/test_0330.png` — stills.
+- `talking_robots_timeline.mp4` — the **start set** (`main`) rendered from the
+  timeline: 640×360, 24 fps, 15 s, H.264. That is what the timeline shows
+  today: one set, its own frame range `1-361`, its cues typing live on the
+  baked per-cue text objects. The shot cuts and the rest of the story are the
+  game's business (press **P**) — see [the authoring
+  model](#the-authoring-model-one-scene-one-set-at-a-time).
+- `test/` — stills: `v2_main_*.png` (typing proofs from the animation render),
+  `v2_noaddon_0030.png` vs `v2_addon_0030.png` (full-line card without the
+  add-on, live typing with it), `v2_menu_*.png` (a previewed set's choice
+  menu), `v2_cuby_*.png` / `v2_sphero_*.png` (the other two sets previewed).
 
-## Play it (needs UPBGE 0.36+ / Blender with the addon)
+## Play it
 
-1. Open `talking_robots.blend` in UPBGE.
-2. Install the addon once: `Edit → Preferences → Add-ons → Install…`,
-   pick `typewriter_subtitles.py`, enable **Typewriter Subtitles (3D Text
-   Keyframes)**. (Timeline subtitles are baked keys since v1.8.0, so they
-   play and render even without it — the addon is for editing + re-baking.)
-3. **Timeline mode:** press **Spacebar**. The 3D subtitles type live on the
-   camera-mounted text object; mouths flap, arms wave, eyes blink.
-4. **Game mode:** press **P**. The same story runs in the game engine:
-   `game_subtitles.py` reads `story.yml` + `dialogue.srt` live, plays each
-   actor's action, types the lines. Pick with **Up/Down + Enter**
-   (or **1**/**2**), **R** restarts, **ESC** quits. The script writes
-   `game_debug.log` next to the .blend (sets, choices, actors) so you can
-   prove the logic ran.
+1. Open `talking_robots.blend` in **UPBGE 0.50**.
+2. Install the add-on once: `Edit → Preferences → Add-ons → Install…`, pick
+   `typewriter_subtitles.py`, enable **Typewriter Subtitles (3D Text
+   Keyframes)**. Timeline subtitles are baked, so they play and render even
+   without it — the add-on is for editing, previewing sets and re-baking.
+3. **Timeline:** press **Spacebar**. The `main` set plays: the robots'
+   `main__*` actions run, the cues type onto the camera-mounted 3D text.
+   Switch to another set with `N → Subtitles → Story sets → Preview <set>`.
+4. **Game:** press **P**. `game_subtitles.py` reads `story.yml` + the `.srt`
+   files live, plays each set's action bundle from `t=0`, moves the render
+   camera between the staged shot cameras, types the lines. **Up/Down +
+   Enter** (or **1**/**2**) picks a choice, **R** restarts, **ESC** quits.
+   `game_debug.log` next to the .blend records sets, choices and actors, so
+   you can prove the logic ran. The sandbox this was built in has no GPU, so
+   the game was verified by unit tests + wiring checks, not by a live run.
 
-## Story sets, actors & choices (v1.8.0+)
+## The authoring model: one scene, one set at a time
 
-The demo is one choice ("Who gets the last word?") with two story sets
-(`cuby`, `sphero`) after the opening `main` set. Authoring is editor-first:
+v2 deliberately has **no master timeline** and **no bake compiler**:
 
-- **Subtitles + animation in sync:** add subtitle entries (panel, `Import`,
-  or edit `dialogue.srt` externally) and keyframes on any object on the
-  same timeline. Subtitle text is baked to one text object per cue
-  (**Bake to Objects**): each cue becomes its own live one-line object
-  with its own key (draggable timing) + visibility keys — plays, scrubs
-  and renders with no addon and no code (full-line cards without it,
-  real typing with it).
-- **`story.yml` wires it into a playable story:** group cues+frames into
-  named **sets**, pick the **start** set, list the **actors** (objects
-  whose own actions the game plays), add **options** to each choice, and
-  set what each set activates on its **end** (`stop`, `goto <set>`,
-  `choice <id>`). Sets ending in a choice end at their prompt cue's start.
-- **Play:** the game reads `story.yml` + `dialogue.srt` live — tweak keys,
-  retime cues, rewire sets, then press **P**. No rebuild, no re-export;
-  the `tw_story` property holds only the path (property strings are
-  length-capped, so no JSON lives in them anymore).
+- **Motion** lives in per-set Blender actions named by the story
+  (`main__cuby`, `cuby__cubymouth`, …), each authored in **set-local time**
+  (frame 1 = the set's `t=0`).
+- **Text** lives in one `.srt` file per set (`dialogue.srt`, `cuby.srt`,
+  `sphero.srt`; also found in `./subtitles/`), rebased to `00:00`, editable
+  with any subtitle software.
+- **Sound** lives in `./audio/` and never blocks a set.
+- The **scene's frame range belongs to whichever set is previewed**. Pressing
+  Space plays that set; pressing P plays the whole story. `story.yml` only
+  wires the three together.
 
-`[CAM Wide|Cuby|Sphero]` lines in `dialogue.srt` still steer the starter
-camera bake from the staged rig (`Wide`/`WideEnd`/`Cuby`/`Sphero` camera
-objects with per-shot lens); after the bake the keys are yours to edit.
-A cue starting with `CUBY:`/`SPHERO:`/`BOTH:` is acted out by those robots;
-anything else is narration. Timeline markers `SET-*`/`CH-*` mark each
-set/choice — the addon's **Jump to Set...** button jumps the playhead to
-one. The choice menu is a state-driven UI object (timeline preview keys +
-in-game show/hide), never an actor.
+Because frames are set-local, only the previewed set is baked to objects (two
+sets baked into one scene would overlap in time). That is exactly what
+**Preview Set** is for — it is the editor half of the game, not a preview of
+a render.
 
-Actor rule of thumb: every actor action should start and end at its rest
-pose, so set entries never snap mid-gesture (the camera holds its last
-frame at set end; the menu is driven by game state, not keys).
+## Story sets, actors & choices
 
-## Game subtitles in your own project (addon v1.6.0+)
+`story.yml` (parsed by `story.py`, stdlib only — the game, the add-on and the
+tools all share that one parser):
 
-Timeline subtitle handlers never run inside the game engine (Blender's clock
-doesn't advance there), so the addon exports your lines for real-time play:
+```yaml
+start: main            # the set played at start
+cps: 30                # typewriter speed (chars per second)
+sets:
+  main:
+    anims:
+      - subs: dialogue.srt#1-8      # typewriter over cues 1..8, blocks
+      - camera: Wide                # opening staged camera (never blocks)
+      - action: CubyRoot@main__cuby # play main__cuby on CubyRoot, blocks
+      - action: SpheroMouth@main__spheromouth
+      - {action: CubyArmR@main__cubyarm, at: 2.5}   # offset in seconds
+      - {audio: room.ogg, wait: false}              # ambience, never blocks
+    end: choice pick   # stop | goto <set> | choice <id>
+  cuby:
+    anims:
+      - subs: cuby.srt#1-2
+      - camera: Cuby
+    end: choice pick2
+choices:
+  pick:
+    prompt: dialogue.srt#9          # cue whose text is the prompt
+    options:
+      - [1, "Ask Cuby about cubes", cuby]     # key, label, target set
+      - [2, "Ask Sphero about spheres", sphero]
+```
 
-1. Select your subtitle text object (the one with the typewriter lines).
-2. In the addon's panel: **Add Game Logic**. This exports the cues (as
-   seconds) into a `tw_game_data` game property, embeds the `tw_game.py`
-   driver as an internal text block, and wires
-   `Always (pulse) -> Python (tw_game.update)`.
-3. Press **P** — the lines type live in the game. **R** restarts.
+Rules worth knowing:
 
-Editing lines later? The panel shows **Game engine: data current/stale**;
-the export refreshes automatically on edit, or press **Refresh** to force it.
-Note: this generic path still exports JSON into a property string (fine for
-typical line counts; file-based export is roadmap). The demo's own driver
-already reads `story.yml` + SRT files instead — see above.
-`tw_game.py` is also shipped standalone (the same file the addon embeds),
-with its headless test `test_tw_game.py`.
+- **Blocking**: `subs` blocks until the last cue's span end, `action` until
+  `isPlayingAction` goes false. `camera` and `audio` **never** block (write
+  `wait: false` for ambience; `wait: true` on them is a warning, not a lie).
+- **Chains and loops are welcome**: `cuby → pick2 → main` is a real loop in
+  this demo. A `goto` cycle with nothing blocking in it is an *error* (it
+  would spin the engine at full speed), and unreachable sets/choices are
+  warnings.
+- **One `camera:` per set** is the opening shot; mid-set cuts come from
+  `[CAM Wide]`-style directive lines inside the `.srt` cue text.
+- **References are Blender names** (`Object@Action`, shot = staged camera
+  object name). Renames are handled for you by the add-on's rename watch.
+- A cue starting `CUBY:` / `SPHERO:` / `BOTH:` is acted out by those robots;
+  anything else is narration. Every actor action starts and ends on its rest
+  pose, so entering a set never snaps mid-gesture.
+- Only this YAML subset parses: `#` comments, `key: value`, `- items`,
+  single-line `[flow, lists]` and `{flow: maps}`, quoted strings, spaces
+  (never tabs).
 
-If subtitles don't appear in-game: check `tw_game_debug.log` (written next to
-the .blend, lists cues + first ticks), confirm the Always sensor pulses, the
-controller is `MODULE tw_game.update`, and that you run UPBGE/BGE with a GPU
-— software GL can't start the game rasterizer.
+## The add-on (v1.9.0): what the Subtitles panel does
 
-## Edit the subtitles
+Select a 3D text object → Sidebar (`N`) → **Subtitles**. Everything from v1 is
+still there (entries + keys, live typing, `Ctrl+Shift+U` to add a line, SRT/VTT
+import/export, the auto-backup + Rebuild/Recover self-heal, Add Game Logic for
+projects without a story). New in v1.9.0 — the **Story sets** box, which works
+with any selection (or none):
 
-- Select the `Subtitles` object → Sidebar (`N`) → **Subtitles** panel.
-  Each list entry is one timeline keyframe; drag the keys in the Timeline /
-  Dope Sheet to retime — the lines follow.
-- `Ctrl+Shift+U` adds a new subtitle at the playhead and jumps to it.
-- `dialogue.srt` is the source script — re-import any time via the panel's
-  **Import** button (or **Export** your edited lines back to SRT/VTT).
-- Typing speed: the `Characters / Second` property (`30`).
-- After any line/retime edit: press **Bake to Objects** so the timeline
-  objects match the entries (the game reads `dialogue.srt` directly, so it
-  never needs the bake).
+| Control | What it does |
+|---|---|
+| `Story File` | Which `story.yml` the tools read (default `//story.yml`, next to the .blend). The game reads its own path from the `tw_story` game property; this one is for the editor. |
+| **Preview `main` / `cuby` / …** | The per-set context switch: that set's cues become the subtitle lines (set-local frames), its `action:` animations get assigned to the actors (action + slot), the render camera snaps to its opening staged shot (lens included), its `end: choice` fills the menu, its audio becomes sequencer sound strips, and the frame range becomes the set's length. It only ever *assigns* — no action, key or line of another set is deleted. |
+| **Refresh Sync** | Writes `story.sync.json` (every action's keyframe range + the uid map the rename watch needs) and `story.schema.json` (VSCode completion for `story.yml`), and sets a fake user on the story's actions so a purge can't eat them. **Also runs automatically on save**, so the sidecar can never drift from your keys. |
+| **Check** | Validates `story.yml` + every `.srt` it references and cross-checks the object/action/camera names against this scene. Results are plain text lines in the box (no graph UI — that was a deliberate veto). |
+| **Apply to Story** | When you rename a referenced object/action/camera, the panel lists the pending renames; Apply rewrites them **only where they are used as references** (`Obj@Act`, `camera: Shot`, `[CAM Shot]` in the `.srt` files) — labels, set names and prose are untouched, and the write is atomic. `Auto-rewrite refs on rename` applies them the moment they are detected instead. |
 
-## Subtitles gone? Recover in 10 seconds
+How the rename watch works: references are names, and names change. So every
+block the story points at carries an invisible `_tw_uid` ID property, and
+`story.sync.json` records `uid → name`. A name whose uid is still there is a
+rename, and a rename is a pending edit rather than a broken story.
 
-What usually happened: the file opens at a frame with no text yet (an empty
-3D text object is *invisible* — nothing to click), and/or the addon wasn't
-enabled, so nothing types and the panel is missing. The lines themselves are
-almost always still in the file — and v1.5+ also keeps an automatic backup
-on the object plus self-repair on load.
-
-1. **(Re)install the addon:** `Edit → Preferences → Add-ons → Install…`,
-   pick `typewriter_subtitles.py` (v1.5.0+), enable it. If an older version
-   is there, remove it first (or press the panel's *Reload Add-on* button).
-2. **Reopen the .blend.** Watch `Window → Toggle System Console`: a line like
-   `auto-recovered 8 line(s)` means it healed itself.
-3. **Select the `Subtitles` object** (Outliner, if the 3D view shows nothing)
-   → Sidebar (`N`) → **Subtitles**. The status line tells the truth, e.g.
-   `8 lines, 8 keys — synced`, plus what the current frame shows.
-4. If it says **needs repair**: press **Rebuild Keys** (lines exist, keys
-   don't) or **Recover Backup** (lines themselves are gone).
-5. **Worst case:** panel → **Import** → `dialogue.srt` with *Replace Existing*
-   → everything (lines + keys) is rebuilt exactly.
-
-The `talking_robots.blend` in this folder already has the backup embedded and
-opens at frame 30 with visible text, so you can verify at a glance.
+**Bake to Objects** is per set now: with a set previewed it bakes
+`<set>_Line01…` (one text object per cue, each with its own draggable key +
+visibility keys, so scrubbing, rendering and the Graph Editor need no add-on
+and no code; without the add-on each cue is a clean full-line card). Re-baking
+reuses the same names, so a re-bake replaces its own previous bake instead of
+stacking `.001` copies. **Jump to Set** is gone: the Preview Set buttons do
+that job (and much more).
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `talking_robots.blend` | The scene: stage, robots, camera move, subtitle keys, game bricks |
-| `talking_robots_timeline.mp4` | Rendered playback (this is the “played in UPBGE” proof) |
-| `typewriter_subtitles.py` | The addon (install + enable, see above) |
-| `dialogue.srt` | Subtitle text + [CAM] shot plan (15 cues, 24 fps) |
-| `story.yml` | Story wiring: sets, actors, choices, ends (the game reads it live) |
-| `story.py` | story.yml + SRT parser, validation, spans (game embeds copies) |
-| `test_story.py` | Story/YAML tests + driver/addon parity checks |
-| `game_subtitles.py` | Game-mode player (also embedded in the .blend as a text block) |
-| `build_scene.py` | Rebuilds the whole .blend from scratch (headless-safe under Xvfb, see below) |
-| `register_addon.py` | Registers the addon for background renders |
-| `set_capture.py` | Makes a `*_capture.blend` that auto-records the game |
-| `autostart_game.py` | Starts the game from a startup script, quits after |
-| `test_game_logic.py` | Headless unit test for the game script (fake `bge` module) |
-| `tw_game.py` | Generic game driver for your own projects (embedded by the addon) |
-| `test_tw_game.py` | Headless unit test for the generic driver |
-| `resave_game.py` | Refreshes demo game setup + self-tests the generic path (Xvfb) |
-| `verify_game.py` | Headless wiring check for the demo .blend |
+| `talking_robots.blend` | The scene: stage, robots, per-set actions, staged shot cams, game bricks |
+| `talking_robots_timeline.mp4` | The rendered **start set** (the timeline proof) |
+| `typewriter_subtitles.py` | The add-on (v1.9.0: subtitles + story preview/sync/rename/validation) |
+| `story.yml` | The wiring: sets (anims + end), choices, start, cps |
+| `dialogue.srt` / `cuby.srt` / `sphero.srt` | Subtitle text per set (+ `[CAM]` shot lines) |
+| `story.sync.json` | Generated: action frame ranges + the `uid → name` map (refreshed on save) |
+| `story.schema.json` | Generated: JSON Schema for `story.yml` (VSCode autocomplete via the `# yaml-language-server=$schema` line) |
+| `story.py` | Shared parser: story + srt parsing, validation, per-set plans, sidecar/schema, targeted reference rewrite |
+| `game_subtitles.py` | The game driver (also embedded in the .blend as a text block) |
+| `tw_game.py` / `test_tw_game.py` | Generic driver for projects *without* a story (embedded by Add Game Logic) + its test |
+| `build_scene.py` | Builds/refreshes the .blend headless (additive: create-if-missing, never deletes keys) |
+| `resave_game.py` | Refreshes the demo's game setup + self-tests the generic path (Xvfb) |
+| `verify_game.py` | Headless wiring check of the .blend (82 checks; never saves) |
+| `register_addon.py` | Registers the add-on for background renders |
+| `set_capture.py`, `autostart_game.py` | Make a `*_capture.blend` that auto-records the game |
+| `test_story.py` | Story/YAML/SRT parsing, plans, sidecar/schema, rewrite, add-on parity |
+| `test_game_logic.py` | Headless unit test for the game driver (sets, choices, loops, capture) |
+| `test_addon_story.py` | In-Blender test of the v2 add-on tools (preview, sync, rename watch, per-set bake) |
+| `test_persistence.py`, `test_ops.py`, `test_load_repair.py` | Recovery/persistence/operator tests (inside Blender) |
 | `test/` | Poster stills |
+| `HANDOFF.md` | State + gotchas for the next session — read it before changing anything |
 
 ## Reproduce / re-render (Linux, headless-safe)
 
 ```bash
-# 1. rebuild the .blend (logic bricks need a display → use Xvfb)
-xvfb-run -a upbge --factory-startup -P build_scene.py
+cd /home/user/talking_robots          # or wherever you cloned this
+U=/home/user/upbge/upbge-0.50-linux-x64   # UPBGE 0.50 (Blender 5.0.1)
 
-# 2. render timeline animation (PNG sequence; addon auto-registers)
-upbge -b talking_robots.blend -P register_addon.py \
-      -o //render/frame_ -F PNG -a   # full scene range (1-708, ~1 h)
+# 0. headless tests (no Blender needed)
+python3 test_story.py && python3 test_game_logic.py && python3 test_tw_game.py
 
-# 3. encode video
-ffmpeg -framerate 24 -i render/frame_%04d.png -c:v libx264 \
-       -pix_fmt yuv420p -crf 19 talking_robots_timeline.mp4
+# 1. build/refresh the .blend (logic bricks need a display → Xvfb; quits itself)
+#    first run wants --factory-startup; re-runs are additive (keys survive)
+timeout 600 xvfb-run -a -s "-screen 0 1280x800x24" \
+    $U/blender --factory-startup -P build_scene.py
 
-# 4. headless game capture (needs a GPU; won't run on pure software GL)
-upbge -b talking_robots.blend -P set_capture.py
+# 2. refresh the demo game setup, then verify the wiring
+timeout 300 xvfb-run -a -s "-screen 0 1280x800x24" \
+    $U/blender talking_robots.blend -P resave_game.py
+$U/blender -b talking_robots.blend -P verify_game.py
+
+# 3. in-Blender tests (add-on operators + the v2 story tools)
+$U/blender -b --factory-startup -P test_addon_story.py
+$U/blender -b --factory-startup -P test_persistence.py          # MODE=A
+$U/blender -b persist_A.blend -P test_load_repair.py
+$U/blender -b persist_A.blend -P test_ops.py
+
+# 4. render the start set (PNG sequence), then encode
+$U/blender -b talking_robots.blend -P register_addon.py -o //render/frame_ -F PNG -a
+ffmpeg -framerate 24 -i render/frame_%04d.png -c:v libx264 -pix_fmt yuv420p \
+       -crf 19 talking_robots_timeline.mp4
+
+# 5. a single frame, with and without the add-on (typing vs full-line card)
+$U/blender -b talking_robots.blend -o //test/noaddon_ -F PNG -f 30
+$U/blender -b talking_robots.blend -P /tmp/reg_addon.py -o //test/addon_ -F PNG -f 30
+
+# 6. headless game capture (needs a GPU; won't run on software GL)
+$U/blender -b talking_robots.blend -P set_capture.py
 blenderplayer -w 640 360 talking_robots_capture.blend   # → capture/game_*.png
-ffmpeg -framerate 30 -i capture/game_%04d.png -c:v libx264 \
-       -pix_fmt yuv420p talking_robots_game.mp4
-
-# 5. game-logic unit tests (no Blender needed)
-python3 test_game_logic.py   # demo driver: sets, actors, choices, capture
-python3 test_tw_game.py      # generic driver: same, via the addon's embed
-python3 test_story.py        # story/YAML/SRT parsing + driver parity
-
-# 6. refresh demo game setup (needs a display -> Xvfb) + verify headless
-xvfb-run -a upbge talking_robots.blend -P resave_game.py   # validates story, quits itself
-upbge -b talking_robots.blend -P verify_game.py
 ```
 
 ## Notes & troubleshooting
 
-- **Camera "shots" are baked action keys.** `Wide`/`WideEnd`/`Cuby`/`Sphero`
-  are a staging rig you frame visually (lens included: 50/50/55/45 mm);
-  the main `Camera` (which carries the parented subtitles/HUD) gets its
-  starter keys baked from them, then both the timeline and the game play
-  the `Camera_anim` action — tweak keys and press **P** with no rebuild.
-  (Separate *active* cameras would strand the HUD, hence the single
-  render camera.) One lens per set in the game (`lens:` in `story.yml`);
-  the timeline can key lens freely.
-- **Never bpy-assign the `Text` game property.** Reading it and creating
-  it are fine, but `prop.value = ...` on a `Text` property corrupts UPBGE
-  0.50 state and segfaults on a later scene op (bisected: any value, any
-  later mutation detonates it). `resave_game.py` ensures the props exist
-  and leaves values alone; the game driver rewrites them every tick.
-- **Never `hide_render` a game object.** UPBGE skips such objects at game
-  conversion ("not in the same layer ... will not be converted") — the
-  choice menu hides via scale-0 keys instead (v1.7.1+), and the driver
-  resets its scale in-game. Game drivers also use `keyboard.inputs` on new
-  UPBGE (`.events` is deprecated) with automatic fallback to `.events`.
-- **Game mode needs a GPU.** The sandbox this was built in has none, so the
-  live game was verified by unit tests + logic inspection only (software GL
-  either crashes or hangs in the game rasterizer). On real hardware with
-  UPBGE + OpenGL 4.3+, just press **P**.
-- **If P freezes:** (1) check `game_debug.log` next to the .blend — its
-  `init ok` / `tick N` lines prove how far the logic got before the freeze;
-  (2) try the standalone player instead of in-Blender P:
-  `blenderplayer talking_robots.blend`; (3) on hybrid-GPU laptops force the
-  discrete GPU (`DRI_PRIME=1 blenderplayer ...`); (4) sanity-check P on an
-  empty scene and report `glxinfo | grep "OpenGL version"`. A freeze with a
-  healthy log means the rasterizer/GPU context, not the dialogue logic.
-- **`bpy.ops.logic.*` segfaults in `blender -b`** (UPBGE 0.50): always run
-  `build_scene.py` under `xvfb-run` *without* `-b` (it quits itself when done).
-- Background *renders* (`-b … -a`) are fine; subtitle objects carry the
-  typewriter effect, so it renders even with no addon loaded.
-- The subtitle object is parented to the camera, so the slow push-in never
-  moves the text off-screen. Sizes: text `0.10` at `(0, -0.44, -3.0)`.
+- **The camera is procedural, not baked.** `Wide` / `Cuby` / `Sphero` are real
+  camera objects carrying the framing *and the lens* (50/55/45 mm). The game
+  smoothsteps + slerps the single render camera between them and follows the
+  lens live, so re-aiming a shot is moving a camera and pressing P — no bake,
+  no rebuild. One render camera (not a per-shot active camera) so the parented
+  subtitles/HUD never get stranded. In the timeline the render camera holds the
+  opening shot of the previewed set (`Preview Set` snaps it for you).
+- **Never bpy-write the `Text` game property.** Reading it and creating it are
+  fine; `prop.value = …` on a `Text` property corrupts UPBGE 0.50 state and
+  segfaults on a later scene op (bisected over ~10 probes). `resave_game.py`
+  and `build_scene.py` create the props and leave the values alone; the game
+  driver rewrites them every tick through the KX path, which is safe.
+- **Never `hide_render` a game object** — UPBGE skips such objects at game
+  conversion. The menu is a plain text object the driver shows by writing its
+  text (and hides by writing `""`), which is why v2 has no menu scale keys.
+- **Game property strings are length-capped**, so they hold *paths only*
+  (`tw_story = //story.yml`); the story itself stays in files next to the
+  .blend, which is also what makes "tweak and press P, no rebuild" work.
+- **Game mode needs a GPU** (OpenGL 4.3+). If **P** freezes with a healthy
+  `game_debug.log`, that is the rasterizer, not the dialogue logic: check the
+  log, try `blenderplayer talking_robots.blend`, force the discrete GPU
+  (`DRI_PRIME=1`), and sanity-check P on an empty scene.
+- **Subtitles gone?** The lines almost always survived: reopen the file (the
+  add-on auto-recovers from the object's embedded backup and prints
+  `auto-recovered N line(s)`), select `Subtitles`, and press **Rebuild Keys**
+  or **Recover Backup**. Worst case: `Import → dialogue.srt` with *Replace
+  Existing*. In v2 the panel's Preview Set is the other one-click fix — it
+  reloads the lines from the set's `.srt` anyway.
+- **After editing keys, cues or the story:** the game needs no rebuild (it
+  reads the files live), but the *editor* needs `Refresh Sync` if you added or
+  retimed an action (that is where the game reads its durations from — and it
+  also runs on save), plus `Bake to Objects` if you want add-on-free renders
+  of the changed set.
+- `bpy.ops.logic.*` segfaults in `blender -b` on UPBGE 0.50: run
+  `build_scene.py` / `resave_game.py` under `xvfb-run` **without** `-b` (they
+  quit themselves). Background *renders* (`-b … -a`) are fine.
 - Mouths/arms/eyes are plain keyframed primitives — no armatures, maximum
-  low-effort charm. Keyframes are dense (every frame); thin them in the
-  Graph Editor if you want to hand-tweak.
-- **v1.7.x → v1.8.0 migration:** `[BRANCH]`/`[CHOICE]`/`[OPT]`/`[GOTO]`/
-  `[END]` SRT directives are legacy (stripped, warned, ignored) — wiring
-  moved to `story.yml` (sets/actors/choices/ends); the `tw_branches` JSON
-  property is now the `tw_story` path; camera `C`/`F1-F3` overrides and
-  the driver's procedural acting are gone (actions play instead).
+  low-effort charm. Keys are dense (every frame) because they are generated;
+  thin them in the Graph Editor if you want to hand-tweak.
+- Blender 5 actions are layered/slotted: `action.fcurves` is the empty legacy
+  API — walk `layers → strips → channelbags` (the add-on's `_action_fcurves`
+  does), and assign `animation_data.action` *before* `action_slot`.
+- **v1.8 → v1.9/v2 migration:** `SET-*` / `CH-*` timeline markers are gone
+  (Preview Set replaced them), `[BRANCH]`/`[CHOICE]`/`[OPT]`/`[GOTO]`/`[END]`
+  directives were already legacy (stripped with a warning), the baked
+  `Camera_anim` action is gone (the driver is procedural), `story.yml` no
+  longer has a `frames:` range or an `actors:` list (actors are implied by the
+  `action:` references), and the game no longer reads one absolute-time
+  `dialogue.srt` for everything — each set rebases to `00:00` in its own file.
 
 Enjoy! Press P. 🤖🤖

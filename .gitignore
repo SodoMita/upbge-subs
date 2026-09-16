@@ -1,3 +1,10 @@
 *.blend1
 __pycache__/
 *.pyc
+persist_*.blend
+render/
+capture/
+*debug.log
+*.sync.json.tmp
+*.yml.tmp
+*_capture.blend

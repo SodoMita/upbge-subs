@@ -338,4 +338,82 @@ addon_stripped = "\n".join(ln for ln in multi.split("\n")
 assert addon_stripped == story.strip_directives(multi)
 print("addon strip parity ok")
 
+# 14) rename watch: uid diff + targeted reference rewrite + sidecar write
+rec = {"u1": {"name": "CubyRoot", "type": "object"},
+       "u2": {"name": "main__cuby", "type": "action"},
+       "u3": {"name": "Wide", "type": "camera"},
+       "u4": {"name": "Ghost", "type": "object"}}
+liv = {"u1": {"name": "CubeRoot", "type": "object"},
+       "u2": {"name": "main__cuby", "type": "action"},
+       "u3": {"name": "Wide", "type": "camera"},
+       "u5": {"name": "NewGuy", "type": "object"}}
+ren, new_ids, missing = story.diff_uids(rec, liv)
+assert ren == [{"uid": "u1", "type": "object", "old": "CubyRoot",
+                "new": "CubeRoot"}], ren
+assert new_ids == [{"uid": "u5", "type": "object", "name": "NewGuy"}]
+assert missing == ["u4"]
+assert story.diff_uids(None, None) == ([], [], [])
+yml = ("start: main\n"
+       "sets:\n"
+       "  main:\n"
+       "    anims:\n"
+       "      - subs: dialogue.srt#1-8\n"
+       "      - camera: Wide\n"
+       "      - action: CubyRoot@main__cuby\n"
+       "      - {action: CubyArmR@main__arm, at: 1.0, wait: false}\n"
+       "    end: goto main\n"
+       "choices:\n"
+       "  pick:\n"
+       "    prompt: dialogue.srt#9\n"
+       "    options:\n"
+       "      - [1, \"Ask CubyRoot about Wide\", main]\n")
+out, applied = story.rewrite_refs(yml, [
+    {"type": "object", "old": "CubyRoot", "new": "CubeRoot"},
+    {"type": "action", "old": "main__arm", "new": "main__armR"},
+    {"type": "camera", "old": "Wide", "new": "WideCam"},
+    {"type": "object", "old": "Nope", "new": "X"}], "yml")
+assert "- action: CubeRoot@main__cuby" in out, out   # object renamed, kept
+assert "CubyArmR@main__armR" in out, "flow-map action renamed"
+assert "camera: WideCam" in out, out
+assert "Ask CubyRoot about Wide" in out, "labels must survive"
+assert len(applied) == 3, applied
+# flow-map camera + quoted values
+out2, _ = story.rewrite_refs("      - {camera: Wide, at: 1.0}\n",
+                             [{"type": "camera", "old": "Wide",
+                               "new": "WideCam"}], "yml")
+assert out2.strip() == "- {camera: WideCam, at: 1.0}", out2
+# a longer name must not be rewritten through a prefix match
+out3, ap3 = story.rewrite_refs("- camera: Wider\n",
+                               [{"type": "camera", "old": "Wide",
+                                 "new": "W2"}], "yml")
+assert out3 == "- camera: Wider\n" and ap3 == [], (out3, ap3)
+# srt side: only [CAM] lines, never prose
+srt = ("1\n00:00:00,000 --> 00:00:01,000\n[CAM Wide]\n"
+       "CUBY: my friend [Wide] and Wide alone stay\n")
+out4, ap4 = story.rewrite_refs(srt, [{"type": "camera", "old": "Wide",
+                                      "new": "WideCam"}], "srt")
+assert "[CAM WideCam]" in out4 and "[Wide] and Wide alone" in out4, out4
+assert ap4 and ap4[0].endswith("(1)")
+# object/action renames are no-ops on .srt text
+assert story.rewrite_refs(srt, [{"type": "object", "old": "Cuby",
+                                 "new": "X"}], "srt") == (srt, [])
+# no-op renames are skipped
+assert story.rewrite_refs(yml, [{"type": "object", "old": "A", "new": "A"},
+                               {"type": "object", "old": "", "new": "B"}],
+                          "yml") == (yml, [])
+payload = story.sidecar_payload({"u1": {"name": "CubeRoot",
+                                        "type": "object"}},
+                                {"main__cuby": [1.0, 361], "junk": [1]})
+assert payload["actions"] == {"main__cuby": [1, 361]}, payload
+assert payload["uids"]["u1"]["name"] == "CubeRoot"
+assert story.save_sidecar("/nonexistent-dir/x.sync.json", payload) != ""
+tmp2 = tempfile.mkdtemp(prefix="twref")
+sp2 = os.path.join(tmp2, "story.sync.json")
+assert story.save_sidecar(sp2, payload) == ""
+assert story.load_sidecar(sp2) == {"uids": payload["uids"],
+                                  "actions": payload["actions"]}
+assert not os.path.exists(sp2 + ".tmp"), "temp file must be renamed away"
+shutil.rmtree(tmp2, ignore_errors=True)
+print("rename/rewrite ok")
+
 print("ALL STORY TESTS PASSED")
